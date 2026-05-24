@@ -12,7 +12,9 @@ const githubRepo = defineString("GITHUB_REPO", { default: "claude-bug-ios-client
 const iosSourceRoot = defineString("IOS_SOURCE_ROOT", { default: "ClaudeBugPoC" });
 
 const CLAUDE_MODEL = "claude-sonnet-4-6";
-const MAX_TOKENS_PER_RESPONSE = 4096;
+// propose_change embeds the full file in newContent; Swift files easily
+// blow past 4K output tokens, so we give Claude plenty of headroom.
+const MAX_TOKENS_PER_RESPONSE = 16384;
 const MAX_AGENT_ITERATIONS = 12;
 const MAX_BUG_DESCRIPTION_LENGTH = 5000;
 const MAX_PROPOSED_FILE_BYTES = 200_000;
@@ -285,12 +287,20 @@ export const askClaude = onCall<BugReportRequest, Promise<BugReportResponse>>(
         proposalsSoFar: proposedChanges.length,
       });
 
-      if (response.stop_reason === "end_turn") {
+      if (response.stop_reason === "end_turn" || response.stop_reason === "max_tokens") {
         const textBlock = response.content.find((b) => b.type === "text");
-        const answer =
+        let answer =
           textBlock && textBlock.type === "text"
             ? textBlock.text
             : "(Claude bir cevap üretemedi)";
+        if (response.stop_reason === "max_tokens") {
+          answer +=
+            "\n\n⚠️ Cevap max_tokens limitine takıldı — bazı önerilen değişiklikler eksik olabilir.";
+          logger.warn("Claude hit max_tokens", {
+            iteration: iterations,
+            outputTokens: response.usage.output_tokens,
+          });
+        }
 
         // Sonnet 4.x pricing per 1M tokens:
         //   input  $3.00  ·  output $15.00
