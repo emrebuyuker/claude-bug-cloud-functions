@@ -86,6 +86,9 @@ export const askClaude = onCall<BugReportRequest, Promise<BugReportResponse>>(
     timeoutSeconds: 120,
     memory: "512MiB",
     region: "us-central1",
+    // TODO: enforce App Check once the iOS app is registered in Firebase
+    // Console with App Attest (requires a paid Apple Developer account).
+    // Add `enforceAppCheck: true` here, then redeploy.
   },
   async (request: CallableRequest<BugReportRequest>): Promise<BugReportResponse> => {
     const { bugDescription } = request.data;
