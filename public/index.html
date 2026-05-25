@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jira Ticket Asistanı</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="container">
+    <header class="header">
+      <h1>Jira Ticket Asistanı</h1>
+      <p class="subtitle">Sorununu doğal dilde anlat — Claude düzgün bir ticket'a çevirip Jira'ya açar.</p>
+    </header>
+
+    <form id="ticketForm" class="card">
+      <label for="userInput" class="label">Ne oldu? Neyi anlatmak istiyorsun?</label>
+      <textarea
+        id="userInput"
+        name="userInput"
+        placeholder="Örnek: Ödeme sayfasında kupon kodu giriyorum ama 'kod geçersiz' yazıyor halbuki dünden beri aktif olması lazım. Production'da yaşıyor, kullanıcılar şikayet ediyor."
+        rows="8"
+        maxlength="5000"
+        required
+      ></textarea>
+      <div class="form-footer">
+        <span id="charCount" class="char-count">0 / 5000</span>
+        <button type="submit" id="submitBtn" class="btn-primary">
+          <span class="btn-label">Ticket Oluştur</span>
+          <span class="spinner" aria-hidden="true"></span>
+        </button>
+      </div>
+    </form>
+
+    <section id="result" class="result-card hidden" aria-live="polite"></section>
+  </main>
+
+  <div id="passwordOverlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="passwordTitle">
+    <div class="overlay-card">
+      <h2 id="passwordTitle" class="overlay-title">Şifre gerekli</h2>
+      <p class="overlay-text">Bu sayfa şifre korumalıdır. Devam etmek için erişim şifresini girin.</p>
+      <form id="passwordForm">
+        <input
+          type="password"
+          id="passwordInput"
+          class="password-input"
+          placeholder="Şifre"
+          autocomplete="current-password"
+          required
+        />
+        <button type="submit" class="btn-primary btn-full">Devam et</button>
+        <p id="passwordError" class="password-error hidden">Şifre yanlış. Tekrar deneyin.</p>
+      </form>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
