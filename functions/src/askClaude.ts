@@ -18,6 +18,9 @@ const MAX_TOKENS_PER_RESPONSE = 16384;
 const MAX_AGENT_ITERATIONS = 12;
 const MAX_BUG_DESCRIPTION_LENGTH = 5000;
 const MAX_PROPOSED_FILE_BYTES = 200_000;
+// Activity timeline is appended to the user prompt as extra context; cap it so a
+// runaway client can't blow up our token bill.
+const MAX_ACTIVITY_LOG_CHARS = 4000;
 
 const SYSTEM_PROMPT = `Sen kıdemli bir iOS geliştirici (Swift, UIKit) AI asistanısın.
 Görevin: Bu iOS uygulamasıyla ilgili bug raporlarını okuyup, GitHub'daki kaynak kodu inceleyerek root cause'u bulup somut fix önermek VE düzeltmeyi tool ile teklif etmek.
@@ -37,16 +40,43 @@ propose_change kuralları:
 - Sadece okuduğun dosyalar için çağır
 - Aynı dosya için birden fazla çağrı yapma (tek seferde tüm değişiklikleri içeren newContent ver)
 
-Cevap formatı (propose_change çağrılarından sonra):
+ÖNEMLİ — Cevap formatı (propose_change çağrılarından sonra):
+Cevabını İKİ kısma ayır. Aralarına TAM olarak şu ayracı koy:
+\`---TEKNİK---\`
+
+Üst kısım (ayracın üstü) — yazılımcı olmayan kullanıcı için:
+- 2-4 cümlelik sade Türkçe özet
+- "Sorun: ...\\nÇözüm: ..." benzeri yapı kullanabilirsin
+- Teknik terim, dosya adı, kod satırı, sınıf adı KULLANMA
+- Kullanıcı bu kısmı görecek, anlayabilmeli
+
+Alt kısım (ayracın altı) — yazılımcı için:
 - ## Root Cause: (problem ne)
 - ## Affected Files: (hangi dosyalar)
 - ## Why: (neden bu fix işe yarar)
-(Kullanıcı kod değişikliklerini propose_change kartlarında görecek; cevap metninde diff tekrarlamana gerek yok.)
+(Kod değişiklikleri propose_change kartlarında görünecek; burada diff tekrarlama.)
+
+Örnek:
+\`\`\`
+Uygulamanın giriş ekranında "Devam" butonuna basıldığında bazen tepki vermediğini fark ettim. Bunun nedeni butonun aynı anda iki kez tetiklenebilmesiydi; tek seferlik bir kilit ekleyerek bu durumu çözdüm.
+
+---TEKNİK---
+
+## Root Cause
+LoginViewController.didTapContinue() içinde isLoading flag kontrolü yoktu, bu yüzden hızlı çift tıklamada iki ayrı async login isteği başlıyordu.
+
+## Affected Files
+- ClaudeBugPoC/Scenes/Login/LoginViewController.swift
+
+## Why
+guard !isLoading else { return } koruması, butonun pending request bittiğinde tekrar enable edilmesi için viewDidLoad'da bağlanan delegate ile birlikte race condition'ı kapatır.
+\`\`\`
 
 Önemli:
 - Tahmin etme, sadece okuduğun koda dayanarak konuş
 - Eğer yetersiz bilgi varsa dosya oku, sorma
-- Cevabın Türkçe olsun`;
+- Cevabın Türkçe olsun
+- Ayracı (\`---TEKNİK---\`) MUTLAKA koy, frontend bu ayraca göre cevabı bölüyor`;
 
 const tools: Anthropic.Tool[] = [
   {
@@ -104,6 +134,21 @@ const tools: Anthropic.Tool[] = [
 
 interface BugReportRequest {
   bugDescription: string;
+  /** Optional iOS-side activity timeline (compact "[T-Xs] TYPE target | k=v" lines). */
+  activityLog?: string;
+}
+
+/**
+ * Validates and trims the client-supplied activity log. Returns `undefined` if
+ * the input is missing, the wrong type, or empty after trimming. Truncates to
+ * MAX_ACTIVITY_LOG_CHARS to bound token spend.
+ */
+export function sanitizeActivityLog(input: unknown): string | undefined {
+  if (typeof input !== "string") return undefined;
+  const trimmed = input.trim();
+  if (trimmed.length === 0) return undefined;
+  if (trimmed.length <= MAX_ACTIVITY_LOG_CHARS) return trimmed;
+  return trimmed.slice(0, MAX_ACTIVITY_LOG_CHARS) + "\n…[truncated]";
 }
 
 interface ProposedChange {
@@ -137,7 +182,7 @@ export const askClaude = onCall<BugReportRequest, Promise<BugReportResponse>>(
     // Add `enforceAppCheck: true` here, then redeploy.
   },
   async (request: CallableRequest<BugReportRequest>): Promise<BugReportResponse> => {
-    const { bugDescription } = request.data;
+    const { bugDescription, activityLog } = request.data;
 
     if (!bugDescription || typeof bugDescription !== "string") {
       throw new HttpsError("invalid-argument", "bugDescription is required (string).");
@@ -148,6 +193,8 @@ export const askClaude = onCall<BugReportRequest, Promise<BugReportResponse>>(
         `bugDescription exceeds max length (${MAX_BUG_DESCRIPTION_LENGTH}).`
       );
     }
+
+    const trimmedActivityLog = sanitizeActivityLog(activityLog);
 
     const owner = githubOwner.value();
     const repo = githubRepo.value();
@@ -236,10 +283,28 @@ export const askClaude = onCall<BugReportRequest, Promise<BugReportResponse>>(
     const sourceRoot = iosSourceRoot.value();
     const systemPrompt = SYSTEM_PROMPT.replace("{{IOS_SOURCE_ROOT}}", sourceRoot);
 
+    const userContentParts = [
+      `GitHub repo: ${owner}/${repo}`,
+      `iOS kaynak dizini: ${sourceRoot}`,
+      "",
+      "Bug raporu:",
+      bugDescription,
+    ];
+    if (trimmedActivityLog) {
+      userContentParts.push(
+        "",
+        "Kullanıcının son aktivitesi (T-Xs = bug gönderiminden X saniye önce):",
+        "```",
+        trimmedActivityLog,
+        "```",
+        "Bu log'u kullanarak hangi ekrandaydı, hangi API çağrıları başarısız oldu, hangi butona dokundu sorularına cevap verebilirsin. Tahmin değil veri.",
+      );
+    }
+
     const messages: Anthropic.MessageParam[] = [
       {
         role: "user",
-        content: `GitHub repo: ${owner}/${repo}\niOS kaynak dizini: ${sourceRoot}\n\nBug raporu:\n${bugDescription}`,
+        content: userContentParts.join("\n"),
       },
     ];
 

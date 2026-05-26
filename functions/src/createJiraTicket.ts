@@ -1,7 +1,8 @@
-import { onRequest } from "firebase-functions/v2/https";
+import { onRequest, onCall, HttpsError, CallableRequest } from "firebase-functions/v2/https";
 import { defineSecret, defineString } from "firebase-functions/params";
 import * as logger from "firebase-functions/logger";
 import Anthropic from "@anthropic-ai/sdk";
+import { sanitizeActivityLog } from "./askClaude";
 
 const anthropicApiKey = defineSecret("ANTHROPIC_API_KEY");
 const jiraEmail = defineSecret("JIRA_EMAIL");
@@ -28,10 +29,17 @@ interface TicketDraft {
 const SYSTEM_PROMPT = `Sen bir Jira ticket asistanısın. Kullanıcı sana doğal dilde bir sorun, görev veya istek anlatır.
 Görevin: Bu anlatımı düzgün bir Jira ticket'ına çevirmek ve create_ticket tool'unu çağırmak.
 
+Bazı isteklerle birlikte "Kullanıcının son aktivitesi" başlığı altında, T-Xs (X saniye önce) zaman damgalı bir timeline gelir. Bu timeline gerçek veridir — varsa description'ı zenginleştirmek için kullan:
+- Hangi ekrandaydı (SCREEN/NAV satırları)
+- Hangi API çağrısı başarısız oldu (NET satırları, status >= 400 veya err= alanı olanlar)
+- Hangi butona dokundu (TAP satırları)
+- Hangi hata gördü (ALERT satırları)
+Description'da bu bilgileri "Adımlar:" benzeri bir bölümle özetleyebilirsin. Timeline yoksa sadece kullanıcının yazdığı metne dayan.
+
 Kurallar:
 - summary: kısa ve anlamlı bir başlık (en fazla 100 karakter), kullanıcının dilinde
-- description: detaylı açıklama, paragraflar halinde, Markdown KULLANMA (sadece düz metin ve paragraf ayırımı için boş satır). Eğer kullanıcı yeterli detay vermediyse, var olan bilgiyi yapılandırılmış şekilde yaz.
-- priority: anlatımdaki aciliyete göre seç (Highest=kritik/prodda patlamış, High=önemli, Medium=normal, Low=ufak, Lowest=nice-to-have)
+- description: detaylı açıklama, paragraflar halinde, Markdown KULLANMA (sadece düz metin ve paragraf ayırımı için boş satır). Eğer kullanıcı yeterli detay vermediyse, var olan bilgiyi (timeline dahil) yapılandırılmış şekilde yaz.
+- priority: anlatımdaki aciliyete göre seç (Highest=kritik/prodda patlamış, High=önemli, Medium=normal, Low=ufak, Lowest=nice-to-have). Timeline'da 5xx hata varsa priority'yi bir kademe yukarı al.
 - issueType: "Bug" (hata/bozuk şey), "Task" (yapılacak iş), "Story" (yeni özellik/kullanıcı isteği)
 - labels: ilgili etiketler (en fazla 5, küçük harf, tire ile ayrı kelimeler — örn. "frontend", "auth-bug")
 
@@ -95,15 +103,20 @@ function toAdf(plainText: string): unknown {
 
 async function parseUserInputWithClaude(
   anthropic: Anthropic,
-  userInput: string
+  userInput: string,
+  activityLog?: string
 ): Promise<TicketDraft> {
+  const userContent = activityLog
+    ? `${userInput}\n\nKullanıcının son aktivitesi (T-Xs = ticket gönderiminden X saniye önce):\n\`\`\`\n${activityLog}\n\`\`\``
+    : userInput;
+
   const response = await anthropic.messages.create({
     model: CLAUDE_MODEL,
     max_tokens: MAX_TOKENS_PER_RESPONSE,
     system: SYSTEM_PROMPT,
     tools,
     tool_choice: { type: "tool", name: "create_ticket" },
-    messages: [{ role: "user", content: userInput }],
+    messages: [{ role: "user", content: userContent }],
   });
 
   const toolUse = response.content.find((b) => b.type === "tool_use");
@@ -513,5 +526,117 @@ export const createJiraTicket = onRequest(
       logger.error("createJiraTicket hata", { message });
       res.status(500).json({ error: message });
     }
+  }
+);
+
+interface BugTicketRequest {
+  bugDescription: string;
+  /** Optional iOS-side activity timeline (compact "[T-Xs] TYPE target | k=v" lines). */
+  activityLog?: string;
+}
+
+interface BugTicketResponse {
+  ticketKey: string;
+  ticketUrl: string;
+  summary: string;
+  priority: JiraPriority;
+  issueType: string;
+  labels: string[];
+  sprintAdded: boolean;
+  sprintName?: string;
+}
+
+export const createBugTicket = onCall<BugTicketRequest, Promise<BugTicketResponse>>(
+  {
+    secrets: [anthropicApiKey, jiraEmail, jiraApiToken],
+    maxInstances: 5,
+    timeoutSeconds: 60,
+    memory: "256MiB",
+    region: "us-central1",
+    // TODO: enforceAppCheck: true — iOS App Attest devreye alındığında aç.
+  },
+  async (request: CallableRequest<BugTicketRequest>): Promise<BugTicketResponse> => {
+    const { bugDescription, activityLog } = request.data;
+
+    if (typeof bugDescription !== "string") {
+      throw new HttpsError("invalid-argument", "bugDescription zorunlu (string).");
+    }
+    const trimmedActivityLog = sanitizeActivityLog(activityLog);
+    if (bugDescription.trim().length < 5) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Lütfen sorununuzu en az birkaç kelimeyle anlatın."
+      );
+    }
+    if (bugDescription.length > MAX_USER_INPUT_LENGTH) {
+      throw new HttpsError(
+        "invalid-argument",
+        `Açıklama çok uzun (en fazla ${MAX_USER_INPUT_LENGTH} karakter).`
+      );
+    }
+
+    const domain = jiraDomain.value();
+    const projectKey = jiraProjectKey.value();
+    if (domain === "REPLACE_ME" || projectKey === "REPLACE_ME") {
+      throw new HttpsError(
+        "failed-precondition",
+        "JIRA_DOMAIN ve JIRA_PROJECT_KEY parametreleri ayarlanmamış."
+      );
+    }
+
+    const anthropic = new Anthropic({ apiKey: anthropicApiKey.value() });
+
+    logger.info("Bug ticket draft oluşturuluyor (callable)", {
+      inputLength: bugDescription.length,
+      hasActivityLog: !!trimmedActivityLog,
+    });
+    const draft = await parseUserInputWithClaude(
+      anthropic,
+      bugDescription,
+      trimmedActivityLog
+    );
+
+    logger.info("Jira'ya gönderiliyor (callable)", {
+      summary: draft.summary,
+      priority: draft.priority,
+      issueType: draft.issueType,
+    });
+
+    const created = await postToJira(
+      draft,
+      domain,
+      projectKey,
+      jiraEmail.value(),
+      jiraApiToken.value()
+    );
+
+    const ticketUrl = `https://${domain}/browse/${created.key}`;
+    logger.info("Bug ticket oluşturuldu (callable)", {
+      key: created.key,
+      url: ticketUrl,
+    });
+
+    let sprintInfo: { added: boolean; sprintName?: string } = { added: false };
+    try {
+      const authHeader =
+        "Basic " +
+        Buffer.from(`${jiraEmail.value()}:${jiraApiToken.value()}`).toString("base64");
+      sprintInfo = await addToActiveSprint(domain, projectKey, created.key, authHeader);
+    } catch (e) {
+      logger.warn("Sprint atama hatası (ticket yine de oluştu)", {
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+
+    return {
+      ticketKey: created.key,
+      ticketUrl,
+      summary: draft.summary,
+      priority: draft.priority,
+      issueType: draft.issueType,
+      labels: draft.labels,
+      sprintAdded: sprintInfo.added,
+      sprintName: sprintInfo.sprintName,
+    };
   }
 );
