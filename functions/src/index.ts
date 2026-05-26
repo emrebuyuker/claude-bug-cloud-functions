@@ -6,3 +6,4 @@ export { askClaude } from "./askClaude";
 export { createPR } from "./createPR";
 export { createJiraTicket, createBugTicket } from "./createJiraTicket";
 export { figmaCompare } from "./figmaCompare";
+export { figmaApplyFix } from "./figmaApplyFix";
