@@ -241,7 +241,7 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
   {
     secrets: [anthropicApiKey, githubToken, figmaToken],
     maxInstances: 5,
-    timeoutSeconds: 240,
+    timeoutSeconds: 540,
     memory: "512MiB",
     region: "us-central1",
   },
@@ -272,6 +272,12 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
     const owner = githubOwner.value();
     const repo = githubRepo.value();
     const sourceRoot = iosSourceRoot.value();
+
+    logger.info("figmaCompare request received", {
+      fileId: figmaRef.fileId,
+      nodeId: figmaRef.nodeId,
+      screenIdentifier,
+    });
 
     try {
       const figmaImage = await fetchFigmaImageDataURL(figmaRef, figmaToken.value());

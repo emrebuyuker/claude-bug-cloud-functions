@@ -210,7 +210,7 @@ export const figmaApplyFix = onCall<FigmaApplyFixRequest, Promise<FigmaApplyFixR
   {
     secrets: [anthropicApiKey, githubToken],
     maxInstances: 3,
-    timeoutSeconds: 300,
+    timeoutSeconds: 540,
     memory: "512MiB",
     region: "us-central1",
     // TODO: enforceAppCheck: true — iOS App Attest devreye alındığında aç.
@@ -261,6 +261,11 @@ export const figmaApplyFix = onCall<FigmaApplyFixRequest, Promise<FigmaApplyFixR
 
     const anthropic = new Anthropic({ apiKey: anthropicApiKey.value() });
     const octokit = new Octokit({ auth: githubToken.value() });
+
+    logger.info("figmaApplyFix request received", {
+      screenIdentifier,
+      differenceTitle: truncate(differenceTitle, 200),
+    });
 
     try {
     const readGitHubFile = async (path: string): Promise<string> => {
