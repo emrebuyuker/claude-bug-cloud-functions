@@ -273,7 +273,8 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
     const repo = githubRepo.value();
     const sourceRoot = iosSourceRoot.value();
 
-    const figmaImage = await fetchFigmaImageDataURL(figmaRef, figmaToken.value());
+    try {
+      const figmaImage = await fetchFigmaImageDataURL(figmaRef, figmaToken.value());
     logger.info("Figma image fetched", {
       fileId: figmaRef.fileId,
       nodeId: figmaRef.nodeId,
@@ -498,5 +499,11 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
       cacheCreationTokens: totalCacheCreationTokens,
       estimatedCostUsd: Math.round(estimatedCostUsd * 10000) / 10000,
     };
+    } catch (err) {
+      if (err instanceof HttpsError) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("figmaCompare failed", { message });
+      throw new HttpsError("internal", `figmaCompare hatası: ${message}`);
+    }
   }
 );

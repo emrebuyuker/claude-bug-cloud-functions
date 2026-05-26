@@ -262,6 +262,7 @@ export const figmaApplyFix = onCall<FigmaApplyFixRequest, Promise<FigmaApplyFixR
     const anthropic = new Anthropic({ apiKey: anthropicApiKey.value() });
     const octokit = new Octokit({ auth: githubToken.value() });
 
+    try {
     const readGitHubFile = async (path: string): Promise<string> => {
       try {
         const response = await octokit.repos.getContent({ owner, repo, path });
@@ -495,5 +496,11 @@ export const figmaApplyFix = onCall<FigmaApplyFixRequest, Promise<FigmaApplyFixR
       outputTokens: totalOutputTokens,
       estimatedCostUsd: Math.round(estimatedCostUsd * 10000) / 10000,
     };
+    } catch (err) {
+      if (err instanceof HttpsError) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("figmaApplyFix failed", { message });
+      throw new HttpsError("internal", `figmaApplyFix hatası: ${message}`);
+    }
   }
 );
