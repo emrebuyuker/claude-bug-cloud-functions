@@ -14,6 +14,8 @@ interface BugReportRequest {
   bugDescription: string;
   /** Optional iOS-side activity timeline (compact "[T-Xs] TYPE target | k=v" lines). */
   activityLog?: string;
+  /** Class name of the screen the user was on when opening the analyzer. */
+  currentScreen?: string;
 }
 
 /**
@@ -34,7 +36,7 @@ export const askClaude = onCall<BugReportRequest, Promise<BugReportResponse>>(
     // Add `enforceAppCheck: true` here, then redeploy.
   },
   async (request): Promise<BugReportResponse> => {
-    const { bugDescription, activityLog } = request.data;
+    const { bugDescription, activityLog, currentScreen } = request.data;
 
     if (!bugDescription || typeof bugDescription !== "string") {
       throw new HttpsError("invalid-argument", "bugDescription is required (string).");
@@ -61,6 +63,7 @@ export const askClaude = onCall<BugReportRequest, Promise<BugReportResponse>>(
       return await runBugAnalysis({
         bugDescription,
         activityLog: sanitizeActivityLog(activityLog),
+        currentScreen: typeof currentScreen === "string" ? currentScreen : undefined,
         anthropic,
         octokit,
         owner,

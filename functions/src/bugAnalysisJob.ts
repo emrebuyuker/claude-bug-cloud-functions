@@ -20,6 +20,8 @@ interface StartBugAnalysisRequest {
   bugDescription: string;
   /** Optional iOS-side activity timeline. */
   activityLog?: string;
+  /** Class name of the screen the user was on when opening the analyzer. */
+  currentScreen?: string;
 }
 
 interface StartBugAnalysisResponse {
@@ -42,7 +44,7 @@ export const startBugAnalysis = onCall<StartBugAnalysisRequest, Promise<StartBug
     // TODO: enforce App Check once the iOS app is registered (see askClaude).
   },
   async (request): Promise<StartBugAnalysisResponse> => {
-    const { bugDescription, activityLog } = request.data;
+    const { bugDescription, activityLog, currentScreen } = request.data;
 
     if (!bugDescription || typeof bugDescription !== "string") {
       throw new HttpsError("invalid-argument", "bugDescription is required (string).");
@@ -59,6 +61,10 @@ export const startBugAnalysis = onCall<StartBugAnalysisRequest, Promise<StartBug
       status: "pending",
       bugDescription,
       activityLog: sanitizeActivityLog(activityLog) ?? null,
+      currentScreen:
+        typeof currentScreen === "string" && currentScreen.trim().length > 0
+          ? currentScreen.trim().slice(0, 100)
+          : null,
       iterations: 0,
       createdAt: FieldValue.serverTimestamp(),
     });
@@ -107,6 +113,7 @@ export const processBugAnalysis = onDocumentCreated(
 
     const bugDescription = claimed.bugDescription as string;
     const activityLog = (claimed.activityLog as string | null) ?? undefined;
+    const currentScreen = (claimed.currentScreen as string | null) ?? undefined;
 
     try {
       const owner = githubOwner.value();
@@ -121,6 +128,7 @@ export const processBugAnalysis = onDocumentCreated(
       const result = await runBugAnalysis({
         bugDescription,
         activityLog,
+        currentScreen,
         anthropic,
         octokit,
         owner,

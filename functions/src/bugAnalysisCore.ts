@@ -18,6 +18,8 @@ Görevin: Bu iOS uygulamasıyla ilgili bug raporlarını okuyup, GitHub'daki kay
 
 iOS uygulama kaynakları repo içinde "{{IOS_SOURCE_ROOT}}" dizini altında bulunur. Analizi orada başlat.
 
+Ekran bağlamı: User mesajında "Kullanıcının bug'ı açtığı ekran" verilmişse, "bu ekran/sayfa/burası" gibi belirsiz ifadeler O ekranı kastediyor — o class'ı repoda arayıp analize oradan başla. Activity log'daki SCREEN kayıtları da ziyaret edilen ekranların class adlarıdır; ilgili dosyayı bulmak için kullan. NOT: "ViewController" bu bug-analiz ekranının kendisidir; bug onunla ilgili değilse onu YOKSAY.
+
 Yaklaşım:
 1. Önce iOS kaynak dizinini list_files ile keşfet
 2. Şüpheli görünen dosyaları read_file ile oku (TAM dosya içeriğini almak şart, çünkü propose_change için yeni içeriği komple yazacaksın). VERİMLİ OL: aynı turda birden çok dosyayı paralel oku — tek tek okuyup adım harcama.
@@ -161,6 +163,9 @@ export interface RunBugAnalysisOptions {
   bugDescription: string;
   /** Optional iOS-side activity timeline (already sanitized/trimmed). */
   activityLog?: string;
+  /** Class name of the screen the user was viewing when they opened the analyzer
+   *  (e.g. "PokemonDetailViewController"). Resolves vague "this page" references. */
+  currentScreen?: string;
   anthropic: Anthropic;
   octokit: Octokit;
   owner: string;
@@ -183,7 +188,7 @@ export interface RunBugAnalysisOptions {
  * status for the async worker).
  */
 export async function runBugAnalysis(opts: RunBugAnalysisOptions): Promise<BugReportResponse> {
-  const { bugDescription, activityLog, anthropic, octokit, owner, repo, sourceRoot, onProgress } = opts;
+  const { bugDescription, activityLog, currentScreen, anthropic, octokit, owner, repo, sourceRoot, onProgress } = opts;
 
   const fileCache = new Map<string, string>();
 
@@ -266,6 +271,14 @@ export async function runBugAnalysis(opts: RunBugAnalysisOptions): Promise<BugRe
     "Bug raporu:",
     bugDescription,
   ];
+  if (currentScreen) {
+    userContentParts.push(
+      "",
+      `Kullanıcının bug'ı açtığı ekran (class adı): ${currentScreen}`,
+      `Kullanıcı "bu ekran/sayfa/burası" gibi ifadeler kullandıysa BU ekranı kastediyor. ` +
+        `Analize bu ekranın class'ını (${currentScreen}) ${sourceRoot} altında arayarak başla; ilgili View/ViewModel/Cell dosyalarını da incele.`,
+    );
+  }
   if (activityLog) {
     userContentParts.push(
       "",
