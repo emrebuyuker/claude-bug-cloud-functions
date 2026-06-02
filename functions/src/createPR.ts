@@ -191,9 +191,12 @@ export const createPR = onCall<CreatePRRequest, Promise<CreatePRResponse>>(
         commitSha: newCommit.data.sha,
       };
     } catch (e) {
+      if (e instanceof HttpsError) throw e;
       const msg = e instanceof Error ? e.message : String(e);
       logger.error("createPR failed", { error: msg });
-      throw new HttpsError("internal", `PR oluşturulamadı: ${msg}`);
+      // "internal" iOS SDK'sında maskelenir (çıplak "INTERNAL"); GitHub hata
+      // mesajı istemcide görünsün diye "unavailable" kullanıyoruz.
+      throw new HttpsError("unavailable", `PR oluşturulamadı: ${msg}`);
     }
   }
 );

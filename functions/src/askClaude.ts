@@ -15,7 +15,7 @@ const CLAUDE_MODEL = "claude-sonnet-4-6";
 // propose_change embeds the full file in newContent; Swift files easily
 // blow past 4K output tokens, so we give Claude plenty of headroom.
 const MAX_TOKENS_PER_RESPONSE = 16384;
-const MAX_AGENT_ITERATIONS = 12;
+const MAX_AGENT_ITERATIONS = 16;
 const MAX_BUG_DESCRIPTION_LENGTH = 5000;
 const MAX_PROPOSED_FILE_BYTES = 200_000;
 // Activity timeline is appended to the user prompt as extra context; cap it so a
@@ -174,7 +174,7 @@ export const askClaude = onCall<BugReportRequest, Promise<BugReportResponse>>(
   {
     secrets: [anthropicApiKey, githubToken],
     maxInstances: 5,
-    timeoutSeconds: 180,
+    timeoutSeconds: 300,
     memory: "512MiB",
     region: "us-central1",
     // TODO: enforce App Check once the iOS app is registered in Firebase
@@ -314,6 +314,7 @@ export const askClaude = onCall<BugReportRequest, Promise<BugReportResponse>>(
     let totalCacheCreationTokens = 0;
     let iterations = 0;
 
+    try {
     while (iterations < MAX_AGENT_ITERATIONS) {
       iterations++;
 
@@ -390,7 +391,7 @@ export const askClaude = onCall<BugReportRequest, Promise<BugReportResponse>>(
 
       if (response.stop_reason !== "tool_use") {
         throw new HttpsError(
-          "internal",
+          "failed-precondition",
           `Unexpected stop_reason: ${response.stop_reason}`
         );
       }
@@ -430,9 +431,41 @@ export const askClaude = onCall<BugReportRequest, Promise<BugReportResponse>>(
       messages.push({ role: "user", content: toolResults });
     }
 
-    throw new HttpsError(
-      "internal",
-      `Agent loop exceeded max iterations (${MAX_AGENT_ITERATIONS}).`
-    );
+    // Döngü tüm iterasyonları tüketti (nadiren). Throw etmek yerine o ana kadar
+    // toplanan önerilerle kısmi bir cevap dön — kullanıcı çıplak "INTERNAL"
+    // yerine anlamlı bir sonuç görsün.
+    logger.warn("askClaude hit iteration cap", {
+      iterations,
+      proposalsSoFar: proposedChanges.length,
+    });
+    const partialCostUsd =
+      (totalInputTokens / 1_000_000) * 3 +
+      (totalCacheCreationTokens / 1_000_000) * 3.75 +
+      (totalCacheReadTokens / 1_000_000) * 0.3 +
+      (totalOutputTokens / 1_000_000) * 15;
+    return {
+      answer:
+        proposedChanges.length > 0
+          ? "Analiz adım sınırına ulaştı ve tam tamamlanamadı, ama bulabildiğim " +
+            "önerileri aşağıda görebilirsin. Daha kesin sonuç için sorunu biraz " +
+            "daha belirgin (hangi ekran, ne zaman) anlatıp tekrar deneyebilirsin."
+          : "Analiz adım sınırına ulaştı ve sonuç üretemedi. Lütfen sorunu biraz " +
+            "daha belirgin (hangi ekran, ne yapınca) anlatıp tekrar dener misin?",
+      proposedChanges,
+      iterations,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
+      cacheReadTokens: totalCacheReadTokens,
+      cacheCreationTokens: totalCacheCreationTokens,
+      estimatedCostUsd: Math.round(partialCostUsd * 10000) / 10000,
+    };
+    } catch (err) {
+      if (err instanceof HttpsError) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("askClaude failed", { message });
+      // "internal" iOS SDK'sında maskelenir (çıplak "INTERNAL"); gerçek mesaj
+      // görünsün diye "unavailable" (geçici / yeniden denenebilir) kullanıyoruz.
+      throw new HttpsError("unavailable", `askClaude hatası: ${message}`);
+    }
   }
 );

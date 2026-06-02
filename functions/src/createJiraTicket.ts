@@ -586,6 +586,7 @@ export const createBugTicket = onCall<BugTicketRequest, Promise<BugTicketRespons
 
     const anthropic = new Anthropic({ apiKey: anthropicApiKey.value() });
 
+    try {
     logger.info("Bug ticket draft oluşturuluyor (callable)", {
       inputLength: bugDescription.length,
       hasActivityLog: !!trimmedActivityLog,
@@ -638,5 +639,13 @@ export const createBugTicket = onCall<BugTicketRequest, Promise<BugTicketRespons
       sprintAdded: sprintInfo.added,
       sprintName: sprintInfo.sprintName,
     };
+    } catch (err) {
+      if (err instanceof HttpsError) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("createBugTicket failed", { message });
+      // "internal" iOS SDK'sında maskelenir (çıplak "INTERNAL"); Claude/Jira
+      // hata mesajı istemcide görünsün diye "unavailable" kullanıyoruz.
+      throw new HttpsError("unavailable", `Ticket oluşturulamadı: ${message}`);
+    }
   }
 );
