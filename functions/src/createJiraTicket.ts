@@ -2,7 +2,7 @@ import { onRequest, onCall, HttpsError, CallableRequest } from "firebase-functio
 import { defineSecret, defineString } from "firebase-functions/params";
 import * as logger from "firebase-functions/logger";
 import Anthropic from "@anthropic-ai/sdk";
-import { sanitizeActivityLog } from "./askClaude";
+import { sanitizeActivityLog } from "./bugAnalysisCore";
 
 const anthropicApiKey = defineSecret("ANTHROPIC_API_KEY");
 const jiraEmail = defineSecret("JIRA_EMAIL");
