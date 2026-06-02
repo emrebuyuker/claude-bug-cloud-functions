@@ -6,7 +6,7 @@ const CLAUDE_MODEL = "claude-sonnet-4-6";
 // propose_change embeds the full file in newContent; Swift files easily
 // blow past 4K output tokens, so we give Claude plenty of headroom.
 const MAX_TOKENS_PER_RESPONSE = 16384;
-const MAX_AGENT_ITERATIONS = 16;
+const MAX_AGENT_ITERATIONS = 22;
 export const MAX_BUG_DESCRIPTION_LENGTH = 5000;
 export const MAX_PROPOSED_FILE_BYTES = 200_000;
 // Activity timeline is appended to the user prompt as extra context; cap it so a
@@ -20,7 +20,7 @@ iOS uygulama kaynakları repo içinde "{{IOS_SOURCE_ROOT}}" dizini altında bulu
 
 Yaklaşım:
 1. Önce iOS kaynak dizinini list_files ile keşfet
-2. Şüpheli görünen dosyaları read_file ile oku (TAM dosya içeriğini almak şart, çünkü propose_change için yeni içeriği komple yazacaksın)
+2. Şüpheli görünen dosyaları read_file ile oku (TAM dosya içeriğini almak şart, çünkü propose_change için yeni içeriği komple yazacaksın). VERİMLİ OL: aynı turda birden çok dosyayı paralel oku — tek tek okuyup adım harcama.
 3. Root cause'u tespit et — varsayım yapma, koda bak
 4. Her düzeltilmesi gereken dosya için propose_change tool'unu çağır. Tek bir fix birden çok dosyaya yayılabilir; her dosya için ayrı bir propose_change yap.
 5. Tüm propose_change çağrılarından SONRA cevabı text olarak özetle.
@@ -66,6 +66,8 @@ guard !isLoading else { return } koruması, butonun pending request bittiğinde 
 Önemli:
 - Tahmin etme, sadece okuduğun koda dayanarak konuş
 - Eğer yetersiz bilgi varsa dosya oku, sorma
+- Adım bütçen sınırlı (~22 tur). Gereğinden fazla keşif yapma; yeterli bilgi toplar toplamaz propose_change yapıp cevabını yaz. Son turda tool kullanımı kapanır — cevabını ZAMANINDA ver.
+- Bug raporu belirsizse (hangi ekran/öğe net değil) ASLA "sonuç üretemedim" deme; okuduğun koda dayanarak EN OLASI neden(ler)i hipotez olarak sun ve mümkünse propose_change ile somut bir düzeltme öner.
 - Cevabın Türkçe olsun
 - Ayracı (\`---TEKNİK---\`) MUTLAKA koy, frontend bu ayraca göre cevabı bölüyor`;
 
@@ -305,7 +307,12 @@ export async function runBugAnalysis(opts: RunBugAnalysisOptions): Promise<BugRe
     iterations++;
     await reportProgress(iterations);
 
-    const response = await anthropic.messages.create({
+    // On the final iteration, drop tools so Claude can no longer keep exploring
+    // and MUST emit its text answer (end_turn). This guarantees a real,
+    // best-effort result instead of the generic "couldn't produce a result"
+    // fallback when the step budget runs out.
+    const isFinalIteration = iterations >= MAX_AGENT_ITERATIONS;
+    const createParams: Anthropic.MessageCreateParamsNonStreaming = {
       model: CLAUDE_MODEL,
       max_tokens: MAX_TOKENS_PER_RESPONSE,
       system: [
@@ -314,9 +321,12 @@ export async function runBugAnalysis(opts: RunBugAnalysisOptions): Promise<BugRe
           text: systemPrompt,
         },
       ],
-      tools,
       messages,
-    });
+    };
+    if (!isFinalIteration) {
+      createParams.tools = tools;
+    }
+    const response = await anthropic.messages.create(createParams);
 
     const usage = response.usage as Anthropic.Usage & {
       cache_creation_input_tokens?: number | null;
