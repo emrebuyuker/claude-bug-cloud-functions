@@ -14,10 +14,11 @@ const iosSourceRoot = defineString("IOS_SOURCE_ROOT", { default: "ClaudeBugPoC" 
 
 const CLAUDE_MODEL = "claude-sonnet-4-6";
 const MAX_TOKENS_PER_RESPONSE = 8192;
-const MAX_AGENT_ITERATIONS = 10;
+const MAX_AGENT_ITERATIONS = 16;
 const MAX_SCREEN_IDENTIFIER_LENGTH = 120;
 const FIGMA_IMAGE_SCALE = 2;
 const MAX_FIGMA_IMAGE_BYTES = 8 * 1024 * 1024;
+const FIGMA_MAX_RETRIES = 2;
 
 const SYSTEM_PROMPT = `Sen kıdemli bir iOS / UI tasarım QA asistanısın. Görevin: kullanıcının verdiği Figma frame görseli ile iOS uygulamasındaki canlı ekranı (Swift kodundan inceleyerek) karşılaştırıp yapısal ve stil farklarını listeleme.
 
@@ -25,7 +26,7 @@ iOS uygulama kaynakları "{{IOS_SOURCE_ROOT}}" dizini altında, UIKit + SnapKit 
 
 Yaklaşım:
 1. Kullanıcı sana hangi ekranı incelediğini söyleyecek (VC tip adı, ör. "PokemonListViewController"). Bu VC için scene klasörünü "{{IOS_SOURCE_ROOT}}/Scenes/..." altında bul.
-2. list_files ile keşfet, sonra read_file ile ilgili View / ViewController / Cell dosyalarını oku. SnapKit constraint'leri, font'lar, renkler, hierarchy bunlarda tanımlı.
+2. list_files ile keşfet, sonra read_file ile ilgili View / ViewController / Cell dosyalarını oku. SnapKit constraint'leri, font'lar, renkler, hierarchy bunlarda tanımlı. VERİMLİ OL: bir scene klasöründeki birden çok dosyayı TEK turda paralel read_file çağrılarıyla oku — her dosya için ayrı tur harcama. Gereksiz keşfe dalma; ilgili klasörü bulur bulmaz dosyaları topluca oku ve hızlıca rapora geç. Tur sayın sınırlı; dağılırsan rapor üretmeden bütçeni tüketirsin.
 3. Figma görselini incele: layout, renk, typography, spacing, hangi UI elementleri var, hangileri yok.
 4. Kod ile görseli karşılaştır. Tahmin etme — sadece okuduğun kodda gördüğüne dayan.
 5. Tüm farkları topladıktan SONRA tek bir report_differences tool çağrısı yap. Bu son tool çağrısı olmalı.
@@ -183,6 +184,43 @@ export function parseFigmaURL(url: string): FigmaFrameRef | null {
   return { fileId, nodeId };
 }
 
+// Figma HTTP durumunu, iOS SDK tarafından maskelenmeyen (mesajı korunan) bir
+// HttpsError koduna eşler. "internal" KULLANMA — iOS'ta çıplak "INTERNAL" görünür.
+type VisibleErrorCode =
+  | "resource-exhausted"
+  | "permission-denied"
+  | "not-found"
+  | "unavailable";
+
+const mapFigmaStatusToCode = (status: number): VisibleErrorCode => {
+  if (status === 429) return "resource-exhausted";
+  if (status === 403) return "permission-denied";
+  if (status === 404) return "not-found";
+  return "unavailable";
+};
+
+// Figma images API'si sık sık 429 (rate limit) döndürür; kısa backoff ile yeniden dener.
+const fetchFigmaImagesWithRetry = async (
+  url: string,
+  token: string
+): Promise<Awaited<ReturnType<typeof fetch>>> => {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, { headers: { "X-Figma-Token": token } });
+    if (res.status !== 429 || attempt >= FIGMA_MAX_RETRIES) return res;
+    // Figma 429'da Retry-After (saniye) gönderebilir; varsa ona uy, yoksa kısa backoff.
+    const retryAfterSec = Number(res.headers.get("retry-after"));
+    const waitMs =
+      Number.isFinite(retryAfterSec) && retryAfterSec > 0
+        ? retryAfterSec * 1000
+        : 1500 * (attempt + 1);
+    // Beklenen süre uzunsa (>8s) yeniden deneyip aynı endpoint'i zorlamak yerine
+    // hızlıca dön — kullanıcı "birkaç dakika sonra tekrar deneyin" mesajını alır.
+    if (waitMs > 8000) return res;
+    logger.warn("Figma API 429, retrying", { attempt: attempt + 1, waitMs });
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+};
+
 async function fetchFigmaImageDataURL(
   ref: FigmaFrameRef,
   token: string
@@ -192,14 +230,14 @@ async function fetchFigmaImageDataURL(
   imagesURL.searchParams.set("format", "png");
   imagesURL.searchParams.set("scale", String(FIGMA_IMAGE_SCALE));
 
-  const response = await fetch(imagesURL.toString(), {
-    headers: { "X-Figma-Token": token },
-  });
+  const response = await fetchFigmaImagesWithRetry(imagesURL.toString(), token);
   if (!response.ok) {
     const body = await response.text().catch(() => "");
     throw new HttpsError(
-      "internal",
-      `Figma API responded ${response.status}: ${body.slice(0, 200)}`
+      mapFigmaStatusToCode(response.status),
+      response.status === 429
+        ? "Figma API hız sınırına takıldı (429). Lütfen birkaç dakika sonra tekrar deneyin."
+        : `Figma API ${response.status} döndü: ${body.slice(0, 200)}`
     );
   }
   const json = (await response.json()) as {
@@ -207,7 +245,7 @@ async function fetchFigmaImageDataURL(
     images: Record<string, string | null>;
   };
   if (json.err) {
-    throw new HttpsError("internal", `Figma API error: ${json.err}`);
+    throw new HttpsError("unavailable", `Figma API hatası: ${json.err}`);
   }
   const imageURL = json.images[ref.nodeId];
   if (!imageURL) {
@@ -220,8 +258,8 @@ async function fetchFigmaImageDataURL(
   const imgResponse = await fetch(imageURL);
   if (!imgResponse.ok) {
     throw new HttpsError(
-      "internal",
-      `Figma CDN responded ${imgResponse.status} when downloading the PNG.`
+      "unavailable",
+      `Figma CDN ${imgResponse.status} döndü (PNG indirilemedi).`
     );
   }
   const arrayBuffer = await imgResponse.arrayBuffer();
@@ -355,6 +393,36 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
 
     const systemPrompt = SYSTEM_PROMPT.replace(/\{\{IOS_SOURCE_ROOT\}\}/g, sourceRoot);
 
+    // Prompt caching — render sırası: tools → system → messages. System bloğunun
+    // sonundaki cache_control breakpoint'i tools + system'i birlikte cache'ler.
+    // (Sonnet min cache prefix'i 2048 token; sistem promptu + tool'lar bunu aşar.)
+    const systemBlocks: Anthropic.TextBlockParam[] = [
+      { type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } },
+    ];
+
+    // Mesaj-seviyesi breakpoint'ler (istek başına en çok 4). STATİK: ilk user turn
+    // (büyük Figma görseli) — bir kez yazılır, ~15 iterasyon okunur. ROLLING: en son
+    // mesaj — büyüyen konuşma önekini (okunan dosya içerikleri) artımlı cache'ler.
+    // Her çağrı öncesi eskileri silip yeniden uyguluyoruz ki 4 sınırı aşılmasın.
+    type Cacheable = { cache_control?: { type: "ephemeral" } };
+    const applyMessageCaching = (msgs: Anthropic.MessageParam[]): void => {
+      for (const m of msgs) {
+        if (Array.isArray(m.content)) {
+          for (const block of m.content) {
+            delete (block as Cacheable).cache_control;
+          }
+        }
+      }
+      const markLast = (m: Anthropic.MessageParam | undefined): void => {
+        if (!m || !Array.isArray(m.content) || m.content.length === 0) return;
+        (m.content[m.content.length - 1] as Cacheable).cache_control = {
+          type: "ephemeral",
+        };
+      };
+      markLast(msgs[0]);
+      markLast(msgs[msgs.length - 1]);
+    };
+
     const userContent: Anthropic.ContentBlockParam[] = [
       {
         type: "image",
@@ -392,11 +460,20 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
     while (iterations < MAX_AGENT_ITERATIONS) {
       iterations++;
 
+      // Son izin verilen turda report_differences'ı ZORLA: agent keşif/okuma yaparken
+      // tüm iterasyonları tüketse bile döngü asla rapor olmadan bitmez (eski "INTERNAL"
+      // hatasının kök nedeni buydu).
+      const forceReport = iterations >= MAX_AGENT_ITERATIONS;
+      const toolChoice: Anthropic.MessageCreateParamsNonStreaming["tool_choice"] =
+        forceReport ? { type: "tool", name: "report_differences" } : undefined;
+
+      applyMessageCaching(messages);
       const response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: MAX_TOKENS_PER_RESPONSE,
-        system: [{ type: "text", text: systemPrompt }],
+        system: systemBlocks,
         tools,
+        tool_choice: toolChoice,
         messages,
       });
 
@@ -414,21 +491,33 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
         stopReason: response.stop_reason,
         inputTokens: usage.input_tokens,
         outputTokens: usage.output_tokens,
+        cacheReadTokens: usage.cache_read_input_tokens ?? 0,
+        cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
       });
 
       if (response.stop_reason === "end_turn" || response.stop_reason === "max_tokens") {
-        if (!reported) {
-          throw new HttpsError(
-            "internal",
-            "Claude finished without calling report_differences."
-          );
-        }
-        break;
+        if (reported) break;
+        // Model raporlamadan turunu bitirdi: cevabını ekle ve bir sonraki turda
+        // raporu açıkça iste. Throw etmek yerine kurtarmaya çalışıyoruz; bir sonraki
+        // tur (gerekirse son tur) report_differences'ı zaten zorlayacak.
+        messages.push({ role: "assistant", content: response.content });
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "Henüz report_differences çağırmadın. Topladığın bilgilerle ŞİMDİ " +
+                "report_differences tool'unu çağır — başka tool çağırma, düz metin yazma.",
+            },
+          ],
+        });
+        continue;
       }
 
       if (response.stop_reason !== "tool_use") {
         throw new HttpsError(
-          "internal",
+          "failed-precondition",
           `Unexpected stop_reason: ${response.stop_reason}`
         );
       }
@@ -476,8 +565,9 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
 
     if (!reported) {
       throw new HttpsError(
-        "internal",
-        `figmaCompare agent loop ended without a report (iterations=${iterations}).`
+        "failed-precondition",
+        `figmaCompare ${iterations} turda rapor üretemedi. Ekran beklenenden karmaşık ` +
+          "olabilir ya da model raporu tamamlayamadı; lütfen tekrar deneyin."
       );
     }
 
@@ -509,7 +599,12 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
       if (err instanceof HttpsError) throw err;
       const message = err instanceof Error ? err.message : String(err);
       logger.error("figmaCompare failed", { message });
-      throw new HttpsError("internal", `figmaCompare hatası: ${message}`);
+      // NOT: "internal" kodu iOS Firebase Functions SDK'sı tarafından maskelenir —
+      // sunucu mesajı atılır ve kullanıcı yalnızca "INTERNAL" görür
+      // (FunctionsError.swift: status=="INTERNAL" => mesaj/details göz ardı edilir).
+      // Mesajın istemcide görünmesi için "unavailable" kullanıyoruz
+      // (geçici / yeniden denenebilir hata semantiği).
+      throw new HttpsError("unavailable", `figmaCompare hatası: ${message}`);
     }
   }
 );

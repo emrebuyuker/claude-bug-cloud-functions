@@ -14,7 +14,7 @@ const baseBranch = defineString("PR_BASE_BRANCH", { default: "main" });
 
 const CLAUDE_MODEL = "claude-sonnet-4-6";
 const MAX_TOKENS_PER_RESPONSE = 8192;
-const MAX_AGENT_ITERATIONS = 12;
+const MAX_AGENT_ITERATIONS = 16;
 const MAX_FILE_BYTES = 200_000;
 const MAX_FIELD_LENGTH = 2000;
 
@@ -25,7 +25,7 @@ iOS uygulama kaynakları "{{IOS_SOURCE_ROOT}}" dizini altında, UIKit + SnapKit 
 Yaklaşım:
 1. Kullanıcı sana hangi ekranı (VC tip adı, ör. "TestDetayViewController") ve hangi farkı düzelteceğini söyleyecek.
 2. list_files ile Scenes/<ScreenName>/ altını keşfet (codeHint ipucundaki dosya adını arayarak başla).
-3. read_file ile ilgili dosyaların tam içeriğini oku.
+3. read_file ile ilgili dosyaların tam içeriğini oku. Birden çok dosya okuyacaksan TEK turda paralel read_file çağrıları yap; gereksiz keşfe dalma — tur bütçen sınırlı, dağılırsan düzenleme üretemeden tükenirsin.
 4. Tek bir dosyada gerekli minimum değişikliği tasarla. Kod stilini, import'ları, MARK comment'ları koru.
 5. propose_edit tool'unu çağır — newContent dosyanın TAM yeni içeriği olmalı (whole file).
 
@@ -332,6 +332,34 @@ export const figmaApplyFix = onCall<FigmaApplyFixRequest, Promise<FigmaApplyFixR
       sourceRoot
     );
 
+    // Prompt caching — render sırası: tools → system → messages. System bloğunun
+    // sonundaki cache_control breakpoint'i tools + system'i birlikte cache'ler.
+    const systemBlocks: Anthropic.TextBlockParam[] = [
+      { type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } },
+    ];
+
+    // Mesaj-seviyesi breakpoint'ler (istek başına en çok 4). STATİK: ilk user turn.
+    // ROLLING: en son mesaj — büyüyen konuşma önekini (okunan Swift dosyaları)
+    // artımlı cache'ler ki her iterasyonda tam fiyata yeniden gönderilmesin.
+    type Cacheable = { cache_control?: { type: "ephemeral" } };
+    const applyMessageCaching = (msgs: Anthropic.MessageParam[]): void => {
+      for (const m of msgs) {
+        if (Array.isArray(m.content)) {
+          for (const block of m.content) {
+            delete (block as Cacheable).cache_control;
+          }
+        }
+      }
+      const markLast = (m: Anthropic.MessageParam | undefined): void => {
+        if (!m || !Array.isArray(m.content) || m.content.length === 0) return;
+        (m.content[m.content.length - 1] as Cacheable).cache_control = {
+          type: "ephemeral",
+        };
+      };
+      markLast(msgs[0]);
+      markLast(msgs[msgs.length - 1]);
+    };
+
     const userText = [
       `GitHub repo: ${owner}/${repo}`,
       `iOS kaynak dizini: ${sourceRoot}`,
@@ -351,7 +379,7 @@ export const figmaApplyFix = onCall<FigmaApplyFixRequest, Promise<FigmaApplyFixR
       .join("\n");
 
     const messages: Anthropic.MessageParam[] = [
-      { role: "user", content: userText },
+      { role: "user", content: [{ type: "text", text: userText }] },
     ];
 
     let totalInputTokens = 0;
@@ -363,10 +391,11 @@ export const figmaApplyFix = onCall<FigmaApplyFixRequest, Promise<FigmaApplyFixR
     while (iterations < MAX_AGENT_ITERATIONS) {
       iterations++;
 
+      applyMessageCaching(messages);
       const response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: MAX_TOKENS_PER_RESPONSE,
-        system: [{ type: "text", text: systemPrompt }],
+        system: systemBlocks,
         tools,
         messages,
       });
@@ -385,24 +414,38 @@ export const figmaApplyFix = onCall<FigmaApplyFixRequest, Promise<FigmaApplyFixR
         stopReason: response.stop_reason,
         inputTokens: usage.input_tokens,
         outputTokens: usage.output_tokens,
+        cacheReadTokens: usage.cache_read_input_tokens ?? 0,
+        cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
       });
 
       if (
         response.stop_reason === "end_turn" ||
         response.stop_reason === "max_tokens"
       ) {
-        if (!proposedEdit) {
-          throw new HttpsError(
-            "internal",
-            "Claude finished without calling propose_edit."
-          );
-        }
-        break;
+        if (proposedEdit) break;
+        // Model propose_edit çağırmadan turunu bitirdi: throw etmek yerine bir tur
+        // daha verip aracı açıkça iste. propose_edit'i tool_choice ile ZORLAMIYORUZ —
+        // dosyayı henüz okumadıysa uydurma bir tam-dosya içeriği üretip bozuk PR
+        // açabilir; modele dosya okuma serbestliği bırakmak daha güvenli.
+        messages.push({ role: "assistant", content: response.content });
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "Henüz propose_edit çağırmadın. Gerekli dosyaları okuduysan ŞİMDİ " +
+                "propose_edit ile tam dosya içerikli düzenlemeni gönder; eksik bilgi " +
+                "varsa önce read_file ile oku.",
+            },
+          ],
+        });
+        continue;
       }
 
       if (response.stop_reason !== "tool_use") {
         throw new HttpsError(
-          "internal",
+          "failed-precondition",
           `Unexpected stop_reason: ${response.stop_reason}`
         );
       }
@@ -443,8 +486,9 @@ export const figmaApplyFix = onCall<FigmaApplyFixRequest, Promise<FigmaApplyFixR
 
     if (!proposedEdit) {
       throw new HttpsError(
-        "internal",
-        `figmaApplyFix agent loop ended without an edit (iterations=${iterations}).`
+        "failed-precondition",
+        `figmaApplyFix ${iterations} turda bir düzenleme üretemedi. ` +
+          "Fark çok karmaşık olabilir ya da model dosyayı bulamadı; lütfen tekrar deneyin."
       );
     }
 
@@ -505,7 +549,10 @@ export const figmaApplyFix = onCall<FigmaApplyFixRequest, Promise<FigmaApplyFixR
       if (err instanceof HttpsError) throw err;
       const message = err instanceof Error ? err.message : String(err);
       logger.error("figmaApplyFix failed", { message });
-      throw new HttpsError("internal", `figmaApplyFix hatası: ${message}`);
+      // NOT: "internal" kodu iOS Firebase Functions SDK'sı tarafından maskelenir
+      // (sunucu mesajı atılır, kullanıcı yalnızca "INTERNAL" görür). Mesajın
+      // istemcide görünmesi için "unavailable" kullanıyoruz.
+      throw new HttpsError("unavailable", `figmaApplyFix hatası: ${message}`);
     }
   }
 );
