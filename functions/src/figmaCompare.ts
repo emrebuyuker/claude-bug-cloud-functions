@@ -18,7 +18,7 @@ const MAX_AGENT_ITERATIONS = 16;
 const MAX_SCREEN_IDENTIFIER_LENGTH = 120;
 const FIGMA_IMAGE_SCALE = 2;
 const MAX_FIGMA_IMAGE_BYTES = 8 * 1024 * 1024;
-const FIGMA_MAX_RETRIES = 2;
+const FIGMA_IMAGE_CACHE_TTL_MS = 10 * 60 * 1000;
 
 const SYSTEM_PROMPT = `Sen kıdemli bir iOS / UI tasarım QA asistanısın. Görevin: kullanıcının verdiği Figma frame görseli ile iOS uygulamasındaki canlı ekranı (Swift kodundan inceleyerek) karşılaştırıp yapısal ve stil farklarını listeleme.
 
@@ -199,27 +199,14 @@ const mapFigmaStatusToCode = (status: number): VisibleErrorCode => {
   return "unavailable";
 };
 
-// Figma images API'si sık sık 429 (rate limit) döndürür; kısa backoff ile yeniden dener.
-const fetchFigmaImagesWithRetry = async (
-  url: string,
-  token: string
-): Promise<Awaited<ReturnType<typeof fetch>>> => {
-  for (let attempt = 0; ; attempt++) {
-    const res = await fetch(url, { headers: { "X-Figma-Token": token } });
-    if (res.status !== 429 || attempt >= FIGMA_MAX_RETRIES) return res;
-    // Figma 429'da Retry-After (saniye) gönderebilir; varsa ona uy, yoksa kısa backoff.
-    const retryAfterSec = Number(res.headers.get("retry-after"));
-    const waitMs =
-      Number.isFinite(retryAfterSec) && retryAfterSec > 0
-        ? retryAfterSec * 1000
-        : 1500 * (attempt + 1);
-    // Beklenen süre uzunsa (>8s) yeniden deneyip aynı endpoint'i zorlamak yerine
-    // hızlıca dön — kullanıcı "birkaç dakika sonra tekrar deneyin" mesajını alır.
-    if (waitMs > 8000) return res;
-    logger.warn("Figma API 429, retrying", { attempt: attempt + 1, waitMs });
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
-  }
-};
+// Render edilen Figma görselini fileId:nodeId:scale ile in-memory cache'ler.
+// /v1/images Tier-1 (en kısıtlı) endpoint — aynı frame'i tekrar tekrar render
+// etmek kıt kotayı tüketir. Kısa TTL ile aynı frame'in tekrarlı testleri tek
+// render harcar. (Cache instance başınadır; maxInstances=5 → kısmi isabet.)
+const figmaImageCache = new Map<
+  string,
+  { base64: string; mediaType: "image/png"; expiresAt: number }
+>();
 
 async function fetchFigmaImageDataURL(
   ref: FigmaFrameRef,
@@ -230,13 +217,25 @@ async function fetchFigmaImageDataURL(
   imagesURL.searchParams.set("format", "png");
   imagesURL.searchParams.set("scale", String(FIGMA_IMAGE_SCALE));
 
-  const response = await fetchFigmaImagesWithRetry(imagesURL.toString(), token);
+  const cacheKey = `${ref.fileId}:${ref.nodeId}:${FIGMA_IMAGE_SCALE}`;
+  const cached = figmaImageCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    logger.info("Figma image cache hit", { cacheKey });
+    return { base64: cached.base64, mediaType: cached.mediaType };
+  }
+
+  // Tek çağrı — 429'da retry YOK. /v1/images limiti çok düşük (View/Collab
+  // seat'te ~6/ay); yeniden denemek kıt kotayı boşa harcar, hızlıca hata dön.
+  const response = await fetch(imagesURL.toString(), {
+    headers: { "X-Figma-Token": token },
+  });
   if (!response.ok) {
     const body = await response.text().catch(() => "");
     throw new HttpsError(
       mapFigmaStatusToCode(response.status),
       response.status === 429
-        ? "Figma API hız sınırına takıldı (429). Lütfen birkaç dakika sonra tekrar deneyin."
+        ? "Figma render kotası aşıldı (429). /v1/images limiti düşüktür — " +
+            "Dev/Full koltuklu bir token kullanın ya da kota yenilenince deneyin."
         : `Figma API ${response.status} döndü: ${body.slice(0, 200)}`
     );
   }
@@ -269,10 +268,14 @@ async function fetchFigmaImageDataURL(
       `Figma image too large (${arrayBuffer.byteLength} bytes).`
     );
   }
-  return {
-    base64: Buffer.from(arrayBuffer).toString("base64"),
+  const base64 = Buffer.from(arrayBuffer).toString("base64");
+  if (figmaImageCache.size > 50) figmaImageCache.clear();
+  figmaImageCache.set(cacheKey, {
+    base64,
     mediaType: "image/png",
-  };
+    expiresAt: Date.now() + FIGMA_IMAGE_CACHE_TTL_MS,
+  });
+  return { base64, mediaType: "image/png" };
 }
 
 export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResponseBody>>(
