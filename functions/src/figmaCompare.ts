@@ -1,8 +1,16 @@
 import { onCall, HttpsError, CallableRequest } from "firebase-functions/v2/https";
 import { defineSecret, defineString } from "firebase-functions/params";
 import * as logger from "firebase-functions/logger";
+import { getApps, initializeApp } from "firebase-admin/app";
+import { getStorage } from "firebase-admin/storage";
 import Anthropic from "@anthropic-ai/sdk";
 import { Octokit } from "@octokit/rest";
+
+// Admin SDK'yı bir kez başlat (Storage cache'i için gerekli). firestore.ts da
+// aynı idempotent guard'ı kullanır; hangisi önce yüklenirse o init eder.
+if (getApps().length === 0) {
+  initializeApp();
+}
 
 const anthropicApiKey = defineSecret("ANTHROPIC_API_KEY");
 const githubToken = defineSecret("GITHUB_TOKEN");
@@ -18,7 +26,15 @@ const MAX_AGENT_ITERATIONS = 16;
 const MAX_SCREEN_IDENTIFIER_LENGTH = 120;
 const FIGMA_IMAGE_SCALE = 2;
 const MAX_FIGMA_IMAGE_BYTES = 8 * 1024 * 1024;
+// İstemcinin doğrudan yüklediği görsel için sınır. Anthropic görsel başına ~5MB
+// kabul eder; bunun üzerini reddediyoruz (callable payload da güvende kalır).
+const MAX_DIRECT_IMAGE_BYTES = 5 * 1024 * 1024;
 const FIGMA_IMAGE_CACHE_TTL_MS = 10 * 60 * 1000;
+// Kalıcı (Storage) cache TTL'i — L1'den uzun: amaç render'ı günler boyu yeniden
+// kullanıp kıt /v1/images kotasını (View/Collab'de 6/ay) korumak. Staleness
+// uyarısı: Figma frame'i bu süre içinde değişirse bayat render döner; tasarım
+// güncellendiyse TTL dolana kadar beklenir (ya da bu sabit kısaltılır).
+const FIGMA_PERSISTENT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 const SYSTEM_PROMPT = `Sen kıdemli bir iOS / UI tasarım QA asistanısın. Görevin: kullanıcının verdiği Figma frame görseli ile iOS uygulamasındaki canlı ekranı (Swift kodundan inceleyerek) karşılaştırıp yapısal ve stil farklarını listeleme.
 
@@ -130,8 +146,12 @@ const tools: Anthropic.Tool[] = [
 ];
 
 interface FigmaCompareRequest {
-  figmaURL: string;
+  // figmaURL ile imageBase64'ten en az biri gerekir. imageBase64 verilirse Figma
+  // /v1/images'e HİÇ gidilmez (kota sorunu yok) — istemci PNG'yi doğrudan yollar.
+  figmaURL?: string;
   screenIdentifier: string;
+  imageBase64?: string;
+  imageMediaType?: string;
 }
 
 interface ReportedDifference {
@@ -158,6 +178,20 @@ interface FigmaFrameRef {
   fileId: string;
   nodeId: string;
 }
+
+// Anthropic'in desteklediği görsel media type'ları. İstemciden geleni bu kümeyle
+// doğrulayıp tanınmayanı varsayılan PNG'ye düşürürüz.
+type SupportedImageMediaType = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+const SUPPORTED_IMAGE_MEDIA_TYPES: readonly SupportedImageMediaType[] = [
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+];
+const normalizeImageMediaType = (raw: unknown): SupportedImageMediaType =>
+  typeof raw === "string" && (SUPPORTED_IMAGE_MEDIA_TYPES as readonly string[]).includes(raw)
+    ? (raw as SupportedImageMediaType)
+    : "image/png";
 
 const FIGMA_URL_REGEX = /figma\.com\/(?:design|file)\/([A-Za-z0-9]+)/;
 
@@ -208,6 +242,66 @@ const figmaImageCache = new Map<
   { base64: string; mediaType: "image/png"; expiresAt: number }
 >();
 
+// L2 (kalıcı) cache — render edilen PNG'yi Firebase Storage'a yazar. L1 in-memory
+// cache yalnızca aynı instance'ın kısa tekrarlarını yakalar (maxInstances=5 →
+// kısmi isabet); L2 instance'lar ve cold start'lar arası paylaşıldığı için aynı
+// frame'in günler süren tekrarlı testleri tek render harcar. Tüm Storage işlemleri
+// try/catch ile sarılı: Storage provision edilmemişse ya da izin/ağ hatası olursa
+// cache devre dışıymış gibi davranır, ana akış ASLA bozulmaz.
+const persistentCachePath = (ref: FigmaFrameRef, scale: number): string =>
+  `figma-render-cache/${ref.fileId}/${ref.nodeId.replace(/:/g, "-")}@${scale}x.png`;
+
+async function readPersistentCache(
+  ref: FigmaFrameRef,
+  scale: number
+): Promise<string | null> {
+  const path = persistentCachePath(ref, scale);
+  try {
+    const file = getStorage().bucket().file(path);
+    const [metadata] = await file.getMetadata(); // obje yoksa fırlatır → miss
+    // Elle seed edilen "pinned" objeler TTL'e takılmaz. Kota olmadan kalıcı cache
+    // için: Figma uygulamasından frame'i PNG @2x export et, bu yola yükle ve custom
+    // metadata pinned=true ekle. Otomatik render'lar pinned set etmez → TTL'e tabi.
+    const pinned = metadata.metadata?.pinned === "true";
+    const createdAt = metadata.timeCreated ? Date.parse(metadata.timeCreated) : 0;
+    if (!pinned && (!createdAt || Date.now() - createdAt > FIGMA_PERSISTENT_CACHE_TTL_MS)) {
+      logger.info("Figma persistent cache stale", { path });
+      return null;
+    }
+    if (pinned) logger.info("Figma persistent cache pinned (TTL bypass)", { path });
+    const [buffer] = await file.download();
+    logger.info("Figma persistent cache hit (L2)", { path });
+    return buffer.toString("base64");
+  } catch (e) {
+    logger.info("Figma persistent cache miss", {
+      path,
+      reason: e instanceof Error ? e.message : String(e),
+    });
+    return null;
+  }
+}
+
+async function writePersistentCache(
+  ref: FigmaFrameRef,
+  scale: number,
+  base64: string
+): Promise<void> {
+  const path = persistentCachePath(ref, scale);
+  try {
+    const file = getStorage().bucket().file(path);
+    await file.save(Buffer.from(base64, "base64"), {
+      resumable: false,
+      metadata: { contentType: "image/png" },
+    });
+    logger.info("Figma persistent cache written", { path });
+  } catch (e) {
+    logger.warn("Figma persistent cache write failed", {
+      path,
+      reason: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
 async function fetchFigmaImageDataURL(
   ref: FigmaFrameRef,
   token: string
@@ -220,8 +314,20 @@ async function fetchFigmaImageDataURL(
   const cacheKey = `${ref.fileId}:${ref.nodeId}:${FIGMA_IMAGE_SCALE}`;
   const cached = figmaImageCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
-    logger.info("Figma image cache hit", { cacheKey });
+    logger.info("Figma image cache hit (L1)", { cacheKey });
     return { base64: cached.base64, mediaType: cached.mediaType };
+  }
+
+  // L1 ıska → kalıcı (Storage) cache'e bak. İsabet ederse L1'i de doldur ve dön;
+  // böylece Figma'ya hiç gitmeden kıt /v1/images kotası korunur.
+  const persisted = await readPersistentCache(ref, FIGMA_IMAGE_SCALE);
+  if (persisted) {
+    figmaImageCache.set(cacheKey, {
+      base64: persisted,
+      mediaType: "image/png",
+      expiresAt: Date.now() + FIGMA_IMAGE_CACHE_TTL_MS,
+    });
+    return { base64: persisted, mediaType: "image/png" };
   }
 
   // Tek çağrı — 429'da retry YOK. /v1/images limiti çok düşük (View/Collab
@@ -231,6 +337,17 @@ async function fetchFigmaImageDataURL(
   });
   if (!response.ok) {
     const body = await response.text().catch(() => "");
+    // 429 teşhisi header'larda: X-Figma-Rate-Limit-Type "low" = View/Collab seat
+    // (ayda 6, KALICI sorun → Dev/Full token + ücretli planda dosya gerekir) ·
+    // "high" = Dev/Full seat (dakikalık limit, GEÇİCİ → Retry-After kadar bekle).
+    // X-Figma-Plan-Tier dosyanın bulunduğu planı gösterir (starter/pro/org/...).
+    logger.warn("Figma /v1/images non-OK", {
+      status: response.status,
+      rateLimitType: response.headers.get("x-figma-rate-limit-type"),
+      retryAfter: response.headers.get("retry-after"),
+      planTier: response.headers.get("x-figma-plan-tier"),
+      bodySnippet: body.slice(0, 200),
+    });
     throw new HttpsError(
       mapFigmaStatusToCode(response.status),
       response.status === 429
@@ -275,6 +392,10 @@ async function fetchFigmaImageDataURL(
     mediaType: "image/png",
     expiresAt: Date.now() + FIGMA_IMAGE_CACHE_TTL_MS,
   });
+  // Kalıcı cache'e de yaz. await ŞART: instance, response döndükten sonra freeze
+  // olabilir; fire-and-forget upload yarıda kalır. Hata writePersistentCache
+  // içinde yutulur, ana akış etkilenmez.
+  await writePersistentCache(ref, FIGMA_IMAGE_SCALE, base64);
   return { base64, mediaType: "image/png" };
 }
 
@@ -287,11 +408,8 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
     region: "us-central1",
   },
   async (request: CallableRequest<FigmaCompareRequest>): Promise<FigmaCompareResponseBody> => {
-    const { figmaURL, screenIdentifier } = request.data;
+    const { figmaURL, screenIdentifier, imageBase64, imageMediaType } = request.data;
 
-    if (!figmaURL || typeof figmaURL !== "string") {
-      throw new HttpsError("invalid-argument", "figmaURL is required (string).");
-    }
     if (!screenIdentifier || typeof screenIdentifier !== "string") {
       throw new HttpsError("invalid-argument", "screenIdentifier is required (string).");
     }
@@ -302,12 +420,25 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
       );
     }
 
-    const figmaRef = parseFigmaURL(figmaURL);
-    if (!figmaRef) {
-      throw new HttpsError(
-        "invalid-argument",
-        "figmaURL is not a recognized Figma frame URL with a node-id."
-      );
+    // İki mod: (1) istemci PNG'yi doğrudan yollar (imageBase64) → Figma'ya HİÇ
+    // gidilmez, kota sorunu yok. (2) figmaURL verilir → /v1/images ile render.
+    // imageBase64 önceliklidir; figmaURL yalnızca o yoksa zorunludur.
+    const hasDirectImage = typeof imageBase64 === "string" && imageBase64.length > 0;
+    let figmaRef: FigmaFrameRef | null = null;
+    if (!hasDirectImage) {
+      if (!figmaURL || typeof figmaURL !== "string") {
+        throw new HttpsError(
+          "invalid-argument",
+          "figmaURL is required when no imageBase64 is provided."
+        );
+      }
+      figmaRef = parseFigmaURL(figmaURL);
+      if (!figmaRef) {
+        throw new HttpsError(
+          "invalid-argument",
+          "figmaURL is not a recognized Figma frame URL with a node-id."
+        );
+      }
     }
 
     const owner = githubOwner.value();
@@ -315,18 +446,49 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
     const sourceRoot = iosSourceRoot.value();
 
     logger.info("figmaCompare request received", {
-      fileId: figmaRef.fileId,
-      nodeId: figmaRef.nodeId,
+      mode: hasDirectImage ? "direct-image" : "figma-render",
+      fileId: figmaRef?.fileId,
+      nodeId: figmaRef?.nodeId,
       screenIdentifier,
     });
 
     try {
-      const figmaImage = await fetchFigmaImageDataURL(figmaRef, figmaToken.value());
-    logger.info("Figma image fetched", {
-      fileId: figmaRef.fileId,
-      nodeId: figmaRef.nodeId,
-      bytesBase64: figmaImage.base64.length,
-    });
+      // Görsel kaynağını belirle: doğrudan yüklenen PNG ya da Figma render.
+      let figmaImage: { base64: string; mediaType: SupportedImageMediaType };
+      if (typeof imageBase64 === "string" && imageBase64.length > 0) {
+        const bytes = Buffer.from(imageBase64, "base64").byteLength;
+        if (bytes === 0) {
+          throw new HttpsError("invalid-argument", "imageBase64 geçersiz base64.");
+        }
+        if (bytes > MAX_DIRECT_IMAGE_BYTES) {
+          throw new HttpsError(
+            "invalid-argument",
+            `Görsel çok büyük (${bytes} bayt). En fazla ${MAX_DIRECT_IMAGE_BYTES} bayt; ` +
+              "daha düşük çözünürlükte (ör. @2x yerine @1x) gönderin."
+          );
+        }
+        figmaImage = {
+          base64: imageBase64,
+          mediaType: normalizeImageMediaType(imageMediaType),
+        };
+        logger.info("figmaCompare using client image (Figma bypassed)", {
+          bytes,
+          mediaType: figmaImage.mediaType,
+        });
+      } else if (figmaRef) {
+        figmaImage = await fetchFigmaImageDataURL(figmaRef, figmaToken.value());
+        logger.info("Figma image fetched", {
+          fileId: figmaRef.fileId,
+          nodeId: figmaRef.nodeId,
+          bytesBase64: figmaImage.base64.length,
+        });
+      } else {
+        // Ulaşılmaz (yukarıda doğrulandı) — tip güvenliği için.
+        throw new HttpsError(
+          "invalid-argument",
+          "Geçerli bir imageBase64 ya da figmaURL sağlanmadı."
+        );
+      }
 
     const anthropic = new Anthropic({ apiKey: anthropicApiKey.value() });
     const octokit = new Octokit({ auth: githubToken.value() });
@@ -441,7 +603,9 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
           `GitHub repo: ${owner}/${repo}`,
           `iOS kaynak dizini: ${sourceRoot}`,
           `Karşılaştırılacak ekran (VC tip adı): ${screenIdentifier}`,
-          `Figma frame: file=${figmaRef.fileId}, node=${figmaRef.nodeId}`,
+          figmaRef
+            ? `Figma frame: file=${figmaRef.fileId}, node=${figmaRef.nodeId}`
+            : "Figma görseli: kullanıcı tarafından doğrudan yüklendi (URL yok).",
           "",
           "Yukarıdaki Figma frame görselini, kullanıcının bulunduğu iOS ekranıyla karşılaştır. " +
             "Önce Scenes/ altında ilgili klasörü list_files ile bul, sonra View/VC/Cell dosyalarını oku, " +
