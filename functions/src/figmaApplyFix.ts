@@ -213,7 +213,7 @@ export const figmaApplyFix = onCall<FigmaApplyFixRequest, Promise<FigmaApplyFixR
     timeoutSeconds: 540,
     memory: "512MiB",
     region: "us-central1",
-    // TODO: enforceAppCheck: true — iOS App Attest devreye alındığında aç.
+    // TODO: enforceAppCheck: true — enable once iOS App Attest is rolled out.
   },
   async (
     request: CallableRequest<FigmaApplyFixRequest>
@@ -332,15 +332,15 @@ export const figmaApplyFix = onCall<FigmaApplyFixRequest, Promise<FigmaApplyFixR
       sourceRoot
     );
 
-    // Prompt caching — render sırası: tools → system → messages. System bloğunun
-    // sonundaki cache_control breakpoint'i tools + system'i birlikte cache'ler.
+    // Prompt caching — render order: tools → system → messages. The cache_control
+    // breakpoint at the end of the system block caches tools + system together.
     const systemBlocks: Anthropic.TextBlockParam[] = [
       { type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } },
     ];
 
-    // Mesaj-seviyesi breakpoint'ler (istek başına en çok 4). STATİK: ilk user turn.
-    // ROLLING: en son mesaj — büyüyen konuşma önekini (okunan Swift dosyaları)
-    // artımlı cache'ler ki her iterasyonda tam fiyata yeniden gönderilmesin.
+    // Message-level breakpoints (max 4 per request). STATIC: the first user turn.
+    // ROLLING: the latest message — incrementally caches the growing conversation
+    // prefix (Swift files read) so it isn't resent at full price every iteration.
     type Cacheable = { cache_control?: { type: "ephemeral" } };
     const applyMessageCaching = (msgs: Anthropic.MessageParam[]): void => {
       for (const m of msgs) {
@@ -423,10 +423,11 @@ export const figmaApplyFix = onCall<FigmaApplyFixRequest, Promise<FigmaApplyFixR
         response.stop_reason === "max_tokens"
       ) {
         if (proposedEdit) break;
-        // Model propose_edit çağırmadan turunu bitirdi: throw etmek yerine bir tur
-        // daha verip aracı açıkça iste. propose_edit'i tool_choice ile ZORLAMIYORUZ —
-        // dosyayı henüz okumadıysa uydurma bir tam-dosya içeriği üretip bozuk PR
-        // açabilir; modele dosya okuma serbestliği bırakmak daha güvenli.
+        // Model ended its turn without calling propose_edit: instead of throwing,
+        // give it one more turn and ask for the tool explicitly. We do NOT force
+        // propose_edit via tool_choice — if it hasn't read the file yet it could
+        // fabricate full-file content and open a broken PR; leaving it free to
+        // read files is safer.
         messages.push({ role: "assistant", content: response.content });
         messages.push({
           role: "user",
@@ -549,9 +550,9 @@ export const figmaApplyFix = onCall<FigmaApplyFixRequest, Promise<FigmaApplyFixR
       if (err instanceof HttpsError) throw err;
       const message = err instanceof Error ? err.message : String(err);
       logger.error("figmaApplyFix failed", { message });
-      // NOT: "internal" kodu iOS Firebase Functions SDK'sı tarafından maskelenir
-      // (sunucu mesajı atılır, kullanıcı yalnızca "INTERNAL" görür). Mesajın
-      // istemcide görünmesi için "unavailable" kullanıyoruz.
+      // NOTE: the "internal" code is masked by the iOS Firebase Functions SDK
+      // (the server message is dropped and the user only sees "INTERNAL"). We use
+      // "unavailable" so the message is visible on the client.
       throw new HttpsError("unavailable", `figmaApplyFix hatası: ${message}`);
     }
   }

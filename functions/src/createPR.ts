@@ -194,8 +194,8 @@ export const createPR = onCall<CreatePRRequest, Promise<CreatePRResponse>>(
       if (e instanceof HttpsError) throw e;
       const msg = e instanceof Error ? e.message : String(e);
       logger.error("createPR failed", { error: msg });
-      // "internal" iOS SDK'sında maskelenir (çıplak "INTERNAL"); GitHub hata
-      // mesajı istemcide görünsün diye "unavailable" kullanıyoruz.
+      // "internal" gets masked in the iOS SDK (bare "INTERNAL"); we use
+      // "unavailable" so the GitHub error message is visible on the client.
       throw new HttpsError("unavailable", `PR oluşturulamadı: ${msg}`);
     }
   }

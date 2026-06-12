@@ -438,9 +438,9 @@ export async function runBugAnalysis(opts: RunBugAnalysisOptions): Promise<BugRe
     messages.push({ role: "user", content: toolResults });
   }
 
-  // Döngü tüm iterasyonları tüketti (nadiren). Throw etmek yerine o ana kadar
-  // toplanan önerilerle kısmi bir cevap dön — kullanıcı çıplak "INTERNAL"
-  // yerine anlamlı bir sonuç görsün.
+  // The loop exhausted all iterations (rare). Instead of throwing, return a
+  // partial answer with the proposals collected so far — so the user sees a
+  // meaningful result instead of a bare "INTERNAL".
   logger.warn("runBugAnalysis hit iteration cap", {
     iterations,
     proposalsSoFar: proposedChanges.length,

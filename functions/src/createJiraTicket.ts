@@ -172,8 +172,8 @@ async function getProjectIssueTypes(
     .map((t) => t.name);
 }
 
-// Jira locale'ine göre issue type isimleri Türkçe veya İngilizce olabilir.
-// Aynı anlamı taşıyan isimleri tek grupta tutuyoruz.
+// Depending on the Jira locale, issue type names may be Turkish or English.
+// We keep names with the same meaning in a single group.
 const ISSUE_TYPE_ALIASES: Record<string, string[]> = {
   bug: ["bug", "hata", "defect", "kusur"],
   task: ["task", "görev", "gorev", "iş"],
@@ -193,34 +193,34 @@ function canonicalize(name: string): string {
 function pickIssueType(requested: string, available: string[]): string {
   if (available.length === 0) return requested;
 
-  // 1. Doğrudan eşleşme (case-insensitive)
+  // 1. Direct match (case-insensitive)
   const direct = available.find(
     (t) => t.toLowerCase() === requested.toLowerCase()
   );
   if (direct) return direct;
 
-  // 2. Anlam üzerinden eşleşme (Görev ↔ Task gibi)
+  // 2. Match by meaning (e.g. Görev ↔ Task)
   const requestedCanonical = canonicalize(requested);
   const aliasMatch = available.find(
     (t) => canonicalize(t) === requestedCanonical
   );
   if (aliasMatch) return aliasMatch;
 
-  // 3. Tercih sırası: Task → Story → Bug → diğer (Epic'i hariç tut çünkü
-  // sprint'e/board'a girmez)
+  // 3. Preference order: Task → Story → Bug → other (exclude Epic since it
+  // doesn't go into a sprint/board)
   for (const pref of ["task", "story", "bug"]) {
     const found = available.find((t) => canonicalize(t) === pref);
     if (found) return found;
   }
 
-  // 4. Son çare: epic ve subtask olmayan ilk type
+  // 4. Last resort: the first type that is neither epic nor subtask
   const nonSpecial = available.find((t) => {
     const c = canonicalize(t);
     return c !== "epic" && c !== "subtask";
   });
   if (nonSpecial) return nonSpecial;
 
-  // 5. Hiçbir şey kalmadıysa ilkini al
+  // 5. If nothing is left, take the first one
   return available[0];
 }
 
@@ -272,8 +272,8 @@ async function postToJira(
 
   let response = await send(body);
 
-  // Bazı Jira Cloud projelerinde "priority" alanı kapalı olur. Bu durumda
-  // 400 dönüp "priority" hatası verir; tekrar prioritysiz deneriz.
+  // Some Jira Cloud projects have the "priority" field disabled. In that case
+  // it returns 400 with a "priority" error; we retry without priority.
   if (!response.ok && response.status === 400) {
     const errText = await response.clone().text();
     if (errText.toLowerCase().includes("priority")) {
@@ -304,8 +304,8 @@ async function addToActiveSprint(
 ): Promise<{ added: boolean; sprintName?: string }> {
   const jsonHeaders = { Authorization: authHeader, Accept: "application/json" };
 
-  // 1. Projenin board(lar)ını bul. Team-managed projelerde board.type
-  // farklı gelebilir, o yüzden type filtresi yapmıyoruz.
+  // 1. Find the project's board(s). Team-managed projects may report a
+  // different board.type, so we don't filter by type.
   const boardsUrl = `https://${domain}/rest/agile/1.0/board?projectKeyOrId=${encodeURIComponent(projectKey)}`;
   const boardsRes = await fetch(boardsUrl, { headers: jsonHeaders });
   if (!boardsRes.ok) {
@@ -329,12 +329,12 @@ async function addToActiveSprint(
     return { added: false };
   }
 
-  // 2. Her board'da aktif sprint ara. İlk bulduğumuza ekliyoruz.
+  // 2. Look for an active sprint on each board. We add to the first one found.
   for (const board of boards) {
     const sprintsUrl = `https://${domain}/rest/agile/1.0/board/${board.id}/sprint?state=active`;
     const sprintsRes = await fetch(sprintsUrl, { headers: jsonHeaders });
     if (!sprintsRes.ok) {
-      // Kanban board'lar sprint endpoint'ini desteklemez (400/404 dönerler)
+      // Kanban boards don't support the sprint endpoint (they return 400/404)
       logger.info("Board sprint desteklemiyor (muhtemelen kanban)", {
         boardId: board.id,
         boardType: board.type,
@@ -351,7 +351,7 @@ async function addToActiveSprint(
       continue;
     }
 
-    // 3. Ticket'ı sprint'e ekle
+    // 3. Add the ticket to the sprint
     const addUrl = `https://${domain}/rest/agile/1.0/sprint/${activeSprint.id}/issue`;
     const addRes = await fetch(addUrl, {
       method: "POST",
@@ -385,7 +385,7 @@ async function addToActiveSprint(
   return { added: false };
 }
 
-// Sabit string karşılaştırması — timing attack'a karşı koruma.
+// Constant-time string comparison — protection against timing attacks.
 function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let result = 0;
@@ -410,8 +410,8 @@ export const createJiraTicket = onRequest(
       return;
     }
 
-    // Şifre doğrulama. Hem expected hem provided şifreyi trim ediyoruz çünkü
-    // Firebase secrets interactive prompt'tan trailing newline gelebiliyor.
+    // Password check. We trim both the expected and provided passwords because
+    // Firebase secrets can pick up a trailing newline from the interactive prompt.
     const providedPassword = (
       req.get("x-access-password") ||
       (typeof req.body === "object" && req.body !== null
@@ -489,8 +489,8 @@ export const createJiraTicket = onRequest(
       const ticketUrl = `https://${domain}/browse/${created.key}`;
       logger.info("Ticket oluşturuldu", { key: created.key, url: ticketUrl });
 
-      // Aktif sprint'e eklemeyi dene. Başarısız olursa ticket zaten oluştu,
-      // backlog'da kalır — request'i fail etme.
+      // Try adding to the active sprint. If it fails, the ticket was already
+      // created and stays in the backlog — don't fail the request.
       let sprintInfo: { added: boolean; sprintName?: string } = { added: false };
       try {
         const authHeader =
@@ -553,7 +553,7 @@ export const createBugTicket = onCall<BugTicketRequest, Promise<BugTicketRespons
     timeoutSeconds: 60,
     memory: "256MiB",
     region: "us-central1",
-    // TODO: enforceAppCheck: true — iOS App Attest devreye alındığında aç.
+    // TODO: enforceAppCheck: true — enable once iOS App Attest is in place.
   },
   async (request: CallableRequest<BugTicketRequest>): Promise<BugTicketResponse> => {
     const { bugDescription, activityLog } = request.data;
@@ -643,8 +643,8 @@ export const createBugTicket = onCall<BugTicketRequest, Promise<BugTicketRespons
       if (err instanceof HttpsError) throw err;
       const message = err instanceof Error ? err.message : String(err);
       logger.error("createBugTicket failed", { message });
-      // "internal" iOS SDK'sında maskelenir (çıplak "INTERNAL"); Claude/Jira
-      // hata mesajı istemcide görünsün diye "unavailable" kullanıyoruz.
+      // "internal" gets masked by the iOS SDK (bare "INTERNAL"); we use
+      // "unavailable" so the Claude/Jira error message shows up on the client.
       throw new HttpsError("unavailable", `Ticket oluşturulamadı: ${message}`);
     }
   }

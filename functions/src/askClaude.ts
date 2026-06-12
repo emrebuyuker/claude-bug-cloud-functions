@@ -74,8 +74,8 @@ export const askClaude = onCall<BugReportRequest, Promise<BugReportResponse>>(
       if (err instanceof HttpsError) throw err;
       const message = err instanceof Error ? err.message : String(err);
       logger.error("askClaude failed", { message });
-      // "internal" iOS SDK'sında maskelenir (çıplak "INTERNAL"); gerçek mesaj
-      // görünsün diye "unavailable" (geçici / yeniden denenebilir) kullanıyoruz.
+      // "internal" gets masked by the iOS SDK (bare "INTERNAL"); we use
+      // "unavailable" (transient / retryable) so the real message shows through.
       throw new HttpsError("unavailable", `askClaude hatası: ${message}`);
     }
   }
