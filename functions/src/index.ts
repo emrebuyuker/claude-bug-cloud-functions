@@ -7,4 +7,5 @@ export { startBugAnalysis, processBugAnalysis } from "./bugAnalysisJob";
 export { createPR } from "./createPR";
 export { createJiraTicket, createBugTicket } from "./createJiraTicket";
 export { figmaCompare } from "./figmaCompare";
+export { figmaCompareGemini } from "./figmaCompareGemini";
 export { figmaApplyFix } from "./figmaApplyFix";

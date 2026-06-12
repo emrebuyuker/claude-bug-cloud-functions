@@ -6,8 +6,8 @@ import { getStorage } from "firebase-admin/storage";
 import Anthropic from "@anthropic-ai/sdk";
 import { Octokit } from "@octokit/rest";
 
-// Admin SDK'yı bir kez başlat (Storage cache'i için gerekli). firestore.ts da
-// aynı idempotent guard'ı kullanır; hangisi önce yüklenirse o init eder.
+// Initialize the Admin SDK once (needed for the Storage cache). firestore.ts
+// uses the same idempotent guard; whichever loads first does the init.
 if (getApps().length === 0) {
   initializeApp();
 }
@@ -23,20 +23,22 @@ const iosSourceRoot = defineString("IOS_SOURCE_ROOT", { default: "ClaudeBugPoC" 
 const CLAUDE_MODEL = "claude-sonnet-4-6";
 const MAX_TOKENS_PER_RESPONSE = 8192;
 const MAX_AGENT_ITERATIONS = 16;
-const MAX_SCREEN_IDENTIFIER_LENGTH = 120;
+export const MAX_SCREEN_IDENTIFIER_LENGTH = 120;
 const FIGMA_IMAGE_SCALE = 2;
 const MAX_FIGMA_IMAGE_BYTES = 8 * 1024 * 1024;
-// İstemcinin doğrudan yüklediği görsel için sınır. Anthropic görsel başına ~5MB
-// kabul eder; bunun üzerini reddediyoruz (callable payload da güvende kalır).
-const MAX_DIRECT_IMAGE_BYTES = 5 * 1024 * 1024;
+// Limit for images uploaded directly by the client. Anthropic accepts ~5MB per
+// image; we reject anything above that (also keeps the callable payload safe).
+export const MAX_DIRECT_IMAGE_BYTES = 5 * 1024 * 1024;
 const FIGMA_IMAGE_CACHE_TTL_MS = 10 * 60 * 1000;
-// Kalıcı (Storage) cache TTL'i — L1'den uzun: amaç render'ı günler boyu yeniden
-// kullanıp kıt /v1/images kotasını (View/Collab'de 6/ay) korumak. Staleness
-// uyarısı: Figma frame'i bu süre içinde değişirse bayat render döner; tasarım
-// güncellendiyse TTL dolana kadar beklenir (ya da bu sabit kısaltılır).
+// Persistent (Storage) cache TTL — longer than L1: the goal is to reuse the
+// render for days and protect the scarce /v1/images quota (6/month on
+// View/Collab). Staleness caveat: if the Figma frame changes within this window
+// a stale render is returned; after a design update either wait for the TTL to
+// expire or shorten this constant.
 const FIGMA_PERSISTENT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
-const SYSTEM_PROMPT = `Sen kıdemli bir iOS / UI tasarım QA asistanısın. Görevin: kullanıcının verdiği Figma frame görseli ile iOS uygulamasındaki canlı ekranı (Swift kodundan inceleyerek) karşılaştırıp yapısal ve stil farklarını listeleme.
+// figmaCompareGemini uses the same task definition — the prompt is provider-agnostic.
+export const SYSTEM_PROMPT = `Sen kıdemli bir iOS / UI tasarım QA asistanısın. Görevin: kullanıcının verdiği Figma frame görseli ile iOS uygulamasındaki canlı ekranı (Swift kodundan inceleyerek) karşılaştırıp yapısal ve stil farklarını listeleme.
 
 iOS uygulama kaynakları "{{IOS_SOURCE_ROOT}}" dizini altında, UIKit + SnapKit kullanılıyor.
 
@@ -145,16 +147,16 @@ const tools: Anthropic.Tool[] = [
   },
 ];
 
-interface FigmaCompareRequest {
-  // figmaURL ile imageBase64'ten en az biri gerekir. imageBase64 verilirse Figma
-  // /v1/images'e HİÇ gidilmez (kota sorunu yok) — istemci PNG'yi doğrudan yollar.
+export interface FigmaCompareRequest {
+  // At least one of figmaURL or imageBase64 is required. If imageBase64 is given,
+  // Figma /v1/images is NEVER hit (no quota issue) — the client sends the PNG directly.
   figmaURL?: string;
   screenIdentifier: string;
   imageBase64?: string;
   imageMediaType?: string;
 }
 
-interface ReportedDifference {
+export interface ReportedDifference {
   category: string;
   severity: string;
   title: string;
@@ -162,7 +164,7 @@ interface ReportedDifference {
   codeHint?: string;
 }
 
-interface FigmaCompareResponseBody {
+export interface FigmaCompareResponseBody {
   detectedScreen: string;
   summary: string;
   differences: ReportedDifference[];
@@ -174,21 +176,21 @@ interface FigmaCompareResponseBody {
   estimatedCostUsd: number;
 }
 
-interface FigmaFrameRef {
+export interface FigmaFrameRef {
   fileId: string;
   nodeId: string;
 }
 
-// Anthropic'in desteklediği görsel media type'ları. İstemciden geleni bu kümeyle
-// doğrulayıp tanınmayanı varsayılan PNG'ye düşürürüz.
-type SupportedImageMediaType = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+// Image media types supported by Anthropic. We validate the client-provided
+// value against this set and fall back to PNG for anything unrecognized.
+export type SupportedImageMediaType = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
 const SUPPORTED_IMAGE_MEDIA_TYPES: readonly SupportedImageMediaType[] = [
   "image/png",
   "image/jpeg",
   "image/gif",
   "image/webp",
 ];
-const normalizeImageMediaType = (raw: unknown): SupportedImageMediaType =>
+export const normalizeImageMediaType = (raw: unknown): SupportedImageMediaType =>
   typeof raw === "string" && (SUPPORTED_IMAGE_MEDIA_TYPES as readonly string[]).includes(raw)
     ? (raw as SupportedImageMediaType)
     : "image/png";
@@ -218,8 +220,8 @@ export function parseFigmaURL(url: string): FigmaFrameRef | null {
   return { fileId, nodeId };
 }
 
-// Figma HTTP durumunu, iOS SDK tarafından maskelenmeyen (mesajı korunan) bir
-// HttpsError koduna eşler. "internal" KULLANMA — iOS'ta çıplak "INTERNAL" görünür.
+// Maps the Figma HTTP status to an HttpsError code that the iOS SDK does not
+// mask (message preserved). Do NOT use "internal" — iOS shows a bare "INTERNAL".
 type VisibleErrorCode =
   | "resource-exhausted"
   | "permission-denied"
@@ -233,21 +235,23 @@ const mapFigmaStatusToCode = (status: number): VisibleErrorCode => {
   return "unavailable";
 };
 
-// Render edilen Figma görselini fileId:nodeId:scale ile in-memory cache'ler.
-// /v1/images Tier-1 (en kısıtlı) endpoint — aynı frame'i tekrar tekrar render
-// etmek kıt kotayı tüketir. Kısa TTL ile aynı frame'in tekrarlı testleri tek
-// render harcar. (Cache instance başınadır; maxInstances=5 → kısmi isabet.)
+// Caches the rendered Figma image in memory, keyed by fileId:nodeId:scale.
+// /v1/images is a Tier-1 (most restricted) endpoint — re-rendering the same
+// frame repeatedly burns the scarce quota. With a short TTL, repeated tests of
+// the same frame cost a single render. (Cache is per instance; maxInstances=5
+// → partial hit rate.)
 const figmaImageCache = new Map<
   string,
   { base64: string; mediaType: "image/png"; expiresAt: number }
 >();
 
-// L2 (kalıcı) cache — render edilen PNG'yi Firebase Storage'a yazar. L1 in-memory
-// cache yalnızca aynı instance'ın kısa tekrarlarını yakalar (maxInstances=5 →
-// kısmi isabet); L2 instance'lar ve cold start'lar arası paylaşıldığı için aynı
-// frame'in günler süren tekrarlı testleri tek render harcar. Tüm Storage işlemleri
-// try/catch ile sarılı: Storage provision edilmemişse ya da izin/ağ hatası olursa
-// cache devre dışıymış gibi davranır, ana akış ASLA bozulmaz.
+// L2 (persistent) cache — writes the rendered PNG to Firebase Storage. The L1
+// in-memory cache only catches short-lived repeats on the same instance
+// (maxInstances=5 → partial hit rate); since L2 is shared across instances and
+// cold starts, days of repeated tests of the same frame cost a single render.
+// All Storage operations are wrapped in try/catch: if Storage isn't provisioned
+// or a permission/network error occurs, it behaves as if the cache is disabled
+// and the main flow is NEVER broken.
 const persistentCachePath = (ref: FigmaFrameRef, scale: number): string =>
   `figma-render-cache/${ref.fileId}/${ref.nodeId.replace(/:/g, "-")}@${scale}x.png`;
 
@@ -258,10 +262,11 @@ async function readPersistentCache(
   const path = persistentCachePath(ref, scale);
   try {
     const file = getStorage().bucket().file(path);
-    const [metadata] = await file.getMetadata(); // obje yoksa fırlatır → miss
-    // Elle seed edilen "pinned" objeler TTL'e takılmaz. Kota olmadan kalıcı cache
-    // için: Figma uygulamasından frame'i PNG @2x export et, bu yola yükle ve custom
-    // metadata pinned=true ekle. Otomatik render'lar pinned set etmez → TTL'e tabi.
+    const [metadata] = await file.getMetadata(); // throws if object missing → miss
+    // Manually seeded "pinned" objects are exempt from the TTL. For a persistent
+    // cache without spending quota: export the frame as PNG @2x from the Figma app,
+    // upload it to this path, and add custom metadata pinned=true. Automatic renders
+    // do not set pinned → subject to the TTL.
     const pinned = metadata.metadata?.pinned === "true";
     const createdAt = metadata.timeCreated ? Date.parse(metadata.timeCreated) : 0;
     if (!pinned && (!createdAt || Date.now() - createdAt > FIGMA_PERSISTENT_CACHE_TTL_MS)) {
@@ -302,7 +307,7 @@ async function writePersistentCache(
   }
 }
 
-async function fetchFigmaImageDataURL(
+export async function fetchFigmaImageDataURL(
   ref: FigmaFrameRef,
   token: string
 ): Promise<{ base64: string; mediaType: "image/png" }> {
@@ -318,8 +323,8 @@ async function fetchFigmaImageDataURL(
     return { base64: cached.base64, mediaType: cached.mediaType };
   }
 
-  // L1 ıska → kalıcı (Storage) cache'e bak. İsabet ederse L1'i de doldur ve dön;
-  // böylece Figma'ya hiç gitmeden kıt /v1/images kotası korunur.
+  // L1 miss → check the persistent (Storage) cache. On a hit, also fill L1 and
+  // return; this protects the scarce /v1/images quota without hitting Figma at all.
   const persisted = await readPersistentCache(ref, FIGMA_IMAGE_SCALE);
   if (persisted) {
     figmaImageCache.set(cacheKey, {
@@ -330,17 +335,17 @@ async function fetchFigmaImageDataURL(
     return { base64: persisted, mediaType: "image/png" };
   }
 
-  // Tek çağrı — 429'da retry YOK. /v1/images limiti çok düşük (View/Collab
-  // seat'te ~6/ay); yeniden denemek kıt kotayı boşa harcar, hızlıca hata dön.
+  // Single call — NO retry on 429. The /v1/images limit is very low (~6/month
+  // on a View/Collab seat); retrying wastes the scarce quota, so fail fast.
   const response = await fetch(imagesURL.toString(), {
     headers: { "X-Figma-Token": token },
   });
   if (!response.ok) {
     const body = await response.text().catch(() => "");
-    // 429 teşhisi header'larda: X-Figma-Rate-Limit-Type "low" = View/Collab seat
-    // (ayda 6, KALICI sorun → Dev/Full token + ücretli planda dosya gerekir) ·
-    // "high" = Dev/Full seat (dakikalık limit, GEÇİCİ → Retry-After kadar bekle).
-    // X-Figma-Plan-Tier dosyanın bulunduğu planı gösterir (starter/pro/org/...).
+    // 429 diagnosis lives in the headers: X-Figma-Rate-Limit-Type "low" = View/Collab
+    // seat (6/month, PERSISTENT problem → needs a Dev/Full token + file on a paid plan) ·
+    // "high" = Dev/Full seat (per-minute limit, TEMPORARY → wait Retry-After).
+    // X-Figma-Plan-Tier shows the plan the file lives on (starter/pro/org/...).
     logger.warn("Figma /v1/images non-OK", {
       status: response.status,
       rateLimitType: response.headers.get("x-figma-rate-limit-type"),
@@ -392,9 +397,9 @@ async function fetchFigmaImageDataURL(
     mediaType: "image/png",
     expiresAt: Date.now() + FIGMA_IMAGE_CACHE_TTL_MS,
   });
-  // Kalıcı cache'e de yaz. await ŞART: instance, response döndükten sonra freeze
-  // olabilir; fire-and-forget upload yarıda kalır. Hata writePersistentCache
-  // içinde yutulur, ana akış etkilenmez.
+  // Also write to the persistent cache. await is REQUIRED: the instance may
+  // freeze after the response returns, leaving a fire-and-forget upload half
+  // done. Errors are swallowed inside writePersistentCache; main flow unaffected.
   await writePersistentCache(ref, FIGMA_IMAGE_SCALE, base64);
   return { base64, mediaType: "image/png" };
 }
@@ -420,9 +425,9 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
       );
     }
 
-    // İki mod: (1) istemci PNG'yi doğrudan yollar (imageBase64) → Figma'ya HİÇ
-    // gidilmez, kota sorunu yok. (2) figmaURL verilir → /v1/images ile render.
-    // imageBase64 önceliklidir; figmaURL yalnızca o yoksa zorunludur.
+    // Two modes: (1) the client sends the PNG directly (imageBase64) → Figma is
+    // NEVER hit, no quota issue. (2) figmaURL is given → render via /v1/images.
+    // imageBase64 takes precedence; figmaURL is only required when it is absent.
     const hasDirectImage = typeof imageBase64 === "string" && imageBase64.length > 0;
     let figmaRef: FigmaFrameRef | null = null;
     if (!hasDirectImage) {
@@ -453,7 +458,7 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
     });
 
     try {
-      // Görsel kaynağını belirle: doğrudan yüklenen PNG ya da Figma render.
+      // Determine the image source: directly uploaded PNG or Figma render.
       let figmaImage: { base64: string; mediaType: SupportedImageMediaType };
       if (typeof imageBase64 === "string" && imageBase64.length > 0) {
         const bytes = Buffer.from(imageBase64, "base64").byteLength;
@@ -483,7 +488,7 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
           bytesBase64: figmaImage.base64.length,
         });
       } else {
-        // Ulaşılmaz (yukarıda doğrulandı) — tip güvenliği için.
+        // Unreachable (validated above) — kept for type safety.
         throw new HttpsError(
           "invalid-argument",
           "Geçerli bir imageBase64 ya da figmaURL sağlanmadı."
@@ -558,17 +563,18 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
 
     const systemPrompt = SYSTEM_PROMPT.replace(/\{\{IOS_SOURCE_ROOT\}\}/g, sourceRoot);
 
-    // Prompt caching — render sırası: tools → system → messages. System bloğunun
-    // sonundaki cache_control breakpoint'i tools + system'i birlikte cache'ler.
-    // (Sonnet min cache prefix'i 2048 token; sistem promptu + tool'lar bunu aşar.)
+    // Prompt caching — render order: tools → system → messages. The cache_control
+    // breakpoint at the end of the system block caches tools + system together.
+    // (Sonnet's min cache prefix is 2048 tokens; system prompt + tools exceed it.)
     const systemBlocks: Anthropic.TextBlockParam[] = [
       { type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } },
     ];
 
-    // Mesaj-seviyesi breakpoint'ler (istek başına en çok 4). STATİK: ilk user turn
-    // (büyük Figma görseli) — bir kez yazılır, ~15 iterasyon okunur. ROLLING: en son
-    // mesaj — büyüyen konuşma önekini (okunan dosya içerikleri) artımlı cache'ler.
-    // Her çağrı öncesi eskileri silip yeniden uyguluyoruz ki 4 sınırı aşılmasın.
+    // Message-level breakpoints (max 4 per request). STATIC: the first user turn
+    // (the large Figma image) — written once, read for ~15 iterations. ROLLING: the
+    // latest message — incrementally caches the growing conversation prefix (file
+    // contents read so far). Before each call we strip the old ones and reapply
+    // so the limit of 4 is never exceeded.
     type Cacheable = { cache_control?: { type: "ephemeral" } };
     const applyMessageCaching = (msgs: Anthropic.MessageParam[]): void => {
       for (const m of msgs) {
@@ -627,9 +633,9 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
     while (iterations < MAX_AGENT_ITERATIONS) {
       iterations++;
 
-      // Son izin verilen turda report_differences'ı ZORLA: agent keşif/okuma yaparken
-      // tüm iterasyonları tüketse bile döngü asla rapor olmadan bitmez (eski "INTERNAL"
-      // hatasının kök nedeni buydu).
+      // FORCE report_differences on the last allowed turn: even if the agent burns
+      // all iterations exploring/reading, the loop never ends without a report (this
+      // was the root cause of the old "INTERNAL" error).
       const forceReport = iterations >= MAX_AGENT_ITERATIONS;
       const toolChoice: Anthropic.MessageCreateParamsNonStreaming["tool_choice"] =
         forceReport ? { type: "tool", name: "report_differences" } : undefined;
@@ -664,9 +670,9 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
 
       if (response.stop_reason === "end_turn" || response.stop_reason === "max_tokens") {
         if (reported) break;
-        // Model raporlamadan turunu bitirdi: cevabını ekle ve bir sonraki turda
-        // raporu açıkça iste. Throw etmek yerine kurtarmaya çalışıyoruz; bir sonraki
-        // tur (gerekirse son tur) report_differences'ı zaten zorlayacak.
+        // The model ended its turn without reporting: append its reply and explicitly
+        // ask for the report on the next turn. We try to recover instead of throwing;
+        // the next turn (the final one if needed) will force report_differences anyway.
         messages.push({ role: "assistant", content: response.content });
         messages.push({
           role: "user",
@@ -722,10 +728,10 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
 
       messages.push({ role: "user", content: toolResults });
 
-      // Tool çağrısı yapıldıysa ve son çağrı report_differences ise, agent loop'u bitebilir.
+      // If a tool call was made and the last one was report_differences, the agent loop can end.
       if (reported) {
-        // Claude'a bir tur daha verip end_turn'u beklemek yerine direkt return ediyoruz —
-        // report_differences çağrısı yapıldığı an iş bitmiş demektir.
+        // We return directly instead of giving Claude one more turn and waiting for
+        // end_turn — the moment report_differences is called, the work is done.
         break;
       }
     }
@@ -766,11 +772,11 @@ export const figmaCompare = onCall<FigmaCompareRequest, Promise<FigmaCompareResp
       if (err instanceof HttpsError) throw err;
       const message = err instanceof Error ? err.message : String(err);
       logger.error("figmaCompare failed", { message });
-      // NOT: "internal" kodu iOS Firebase Functions SDK'sı tarafından maskelenir —
-      // sunucu mesajı atılır ve kullanıcı yalnızca "INTERNAL" görür
-      // (FunctionsError.swift: status=="INTERNAL" => mesaj/details göz ardı edilir).
-      // Mesajın istemcide görünmesi için "unavailable" kullanıyoruz
-      // (geçici / yeniden denenebilir hata semantiği).
+      // NOTE: the "internal" code is masked by the iOS Firebase Functions SDK —
+      // the server message is dropped and the user only sees "INTERNAL"
+      // (FunctionsError.swift: status=="INTERNAL" => message/details are ignored).
+      // We use "unavailable" so the message reaches the client
+      // (transient / retryable error semantics).
       throw new HttpsError("unavailable", `figmaCompare hatası: ${message}`);
     }
   }
